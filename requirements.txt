@@ -1,0 +1,11 @@
+scikit-learn
+scipy
+matplotlib
+deepspeed==0.16.5
+peft==0.15.1
+editdistance==0.8.1
+transformers==4.50.3
+accelerate==1.6.0
+peft==0.14.0
+llm2vec==0.2.3
+torch==2.6.0
