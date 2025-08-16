@@ -95,83 +95,78 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
     )
 
     # ------------------------------------------------------------------
-    # FKD PRE-PASS: compute Block Influence (BI) on calibration set using teacher
-    # BI_l = 1 - mean(cos(X_l, Y_l)), where X_l is hidden_states[l] and Y_l is hidden_states[l+1]
+    # EAADP CIS PRE-PASS (accumulate over toàn bộ train set trước khi train)
+    # Sau đó khởi tạo EAS (EnhancedAttentionSelector) một lần, rồi bước vào vòng train bình thường.
 
-    if getattr(args, 'criterion', None) == 'fkd' and getattr(model.module, 'teacher_model', None) is not None:
-        distiller = model.module  # unwrap Distiller
+    if getattr(args, 'criterion', None) == 'eaadp':
+        distiller = model.module  # DeepSpeedEngine bọc Distiller
         if dist.get_rank() == 0:
-            print("[FKD] Starting BI pre-pass on calibration set...")
-
+            print("[EAADP] Bắt đầu pre-pass tính CIS trên toàn bộ train set (không update params)...")
+        # Dataloader pre-pass (không shuffle để ổn định; không drop_last để dùng đủ mẫu)
+        
         pre_sampler = DistributedSampler(
             dataset['train'], shuffle=False, drop_last=False,
             rank=dp_rank, num_replicas=dp_world_size
         )
         pre_loader = DataLoader(
             dataset['train'], sampler=pre_sampler,
-            batch_size=args.eval_batch_size or args.batch_size, num_workers=args.num_workers,
+            batch_size=args.batch_size, num_workers=args.num_workers,
             collate_fn=dataset['train'].collate
         )
-        teacher = distiller.teacher_model
-        teacher.eval()
-
-        bi_sums = None
-        token_counts = None
-        max_batches = getattr(args, 'fkd_calib_max_batches', 0)
-        it = 0
+        distiller.teacher_model.eval()
+    
         iterator = pre_loader
         if dist.get_rank() == 0:
-            iterator = _tqdm(pre_loader, desc="FKD BI pre-pass", dynamic_ncols=True)
-        with torch.no_grad():
-            for input_batch, output_batch in iterator:
-                dataset['train'].move_to_device([input_batch, output_batch], device)
-                t_out = teacher(
+            iterator = _tqdm(pre_loader, desc="EAADP CIS pre-pass", dynamic_ncols=True)
+
+        for batch_pp in iterator:
+            input_batch, output_batch = batch_pp
+            dataset['train'].move_to_device([input_batch, output_batch], device)
+            with torch.no_grad():
+                # Forward teacher and student to collect hidden states (no gradients, no labels)
+                t_out = distiller.teacher_model(
                     input_batch["teacher_input_ids"],
                     attention_mask=input_batch.get("teacher_attention_mask", None),
                     output_hidden_states=True,
+                    output_attentions=getattr(criterion, 'use_attn_for_cis', False),
                     return_dict=True,
                 )
-                hs = t_out.hidden_states  # tuple len L+1
-                L = len(hs) - 1
-                if bi_sums is None:
-                    bi_sums = torch.zeros(L, device=device, dtype=torch.float64)
-                    token_counts = torch.zeros(L, device=device, dtype=torch.float64)
-                mask = input_batch.get("teacher_attention_mask", None)
-                if mask is not None:
-                    mask = mask.to(device=device, dtype=torch.float32)
-                for l in range(L):
-                    X = hs[l]      # (B, T, H)
-                    Y = hs[l+1]    # (B, T, H)
-                    cos = F.cosine_similarity(X, Y, dim=-1)  # (B, T)
-                    bi = 1.0 - cos
-                    if mask is not None:
-                        bi = bi * mask
-                        count = mask.sum()
-                    else:
-                        count = torch.tensor(bi.numel(), device=device, dtype=torch.float32)
-                    bi_sums[l] += bi.sum(dtype=torch.float64)
-                    token_counts[l] += count.to(torch.float64)
-                it += 1
-                if max_batches and it >= max_batches:
-                    break
-        # reduce across ranks
-        dist.all_reduce(bi_sums, op=dist.ReduceOp.SUM)
-        dist.all_reduce(token_counts, op=dist.ReduceOp.SUM)
-        bi_scores = (bi_sums / token_counts.clamp(min=1.0)).to(torch.float32)
-        # top-k select
-        k = min(getattr(args, 'fkd_k', 4), bi_scores.numel())
-        sorted_vals, sorted_idx = torch.sort(bi_scores, descending=True)
-        top_idx = sorted_idx[:k].tolist()
-        # store to distiller
-        distiller.fkd_info = {
-            "bi_scores": bi_scores.detach().cpu().tolist(),
-            "top_indices": top_idx,
-        }
+                s_out = distiller.student_model(
+                    input_batch["input_ids"],
+                    attention_mask=input_batch.get("attention_mask", None),
+                    output_hidden_states=True,
+                    output_attentions=getattr(criterion, 'use_attn_for_cis', False),
+                    return_dict=True,
+                )
+
+                # Accumulate CIS for teacher and student
+                t_attn = t_out.attentions if (getattr(criterion, 'use_attn_for_cis', False) and hasattr(t_out, 'attentions')) else None
+                s_attn = s_out.attentions if (getattr(criterion, 'use_attn_for_cis', False) and hasattr(s_out, 'attentions')) else None
+                criterion._accumulate_cis_batch(
+                    hs_tuple=t_out.hidden_states,
+                    attn_mask=input_batch.get("teacher_attention_mask", None),
+                    is_teacher=True,
+                    attn_tuple=t_attn,
+                )
+                criterion._accumulate_cis_batch(
+                    hs_tuple=s_out.hidden_states,
+                    attn_mask=input_batch.get("attention_mask", None),
+                    is_teacher=False,
+                    attn_tuple=s_attn,
+                )
+                # Step counter for logging
+                criterion._cis_steps += 1
+
+        if criterion._t_sums is None or criterion._s_sums is None:
+            raise RuntimeError("[EAADP] Pre-pass không thu được CIS (có thể dataset rỗng?)")
+        t_cis, s_cis = criterion._finalize_cis(device)
+
+        # Re-init EAS weights in-place based on CIS (keep module instance for optimizer consistency)
+        distiller.eas.reset_with_cis(t_cis, s_cis)
+        distiller.eaadp_cis_updated = True
         if dist.get_rank() == 0:
-            printable = [(int(i), float(bi_scores[i].item())) for i in sorted_idx.tolist()]
-            print("[FKD] BI scores (desc):", printable)
-            print(f"[FKD] Selected top-{k} layers:", top_idx)
-        # recreate training sampler with shuffle
+            print(f"[EAADP] Hoàn tất pre-pass CIS: collected {criterion._cis_steps} batches. Top-k={getattr(args,'eaadp_top_k',3)}")
+        # Sau pre-pass: tạo lại sampler shuffle cho training chuẩn
         sampler = DistributedSampler(
             dataset["train"], 
             shuffle=True, 
@@ -303,7 +298,7 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
         int(total_seconds % 60)
     ))
 
-@torch.no_grad()
+@torch.no_grad
 def evaluate(args, tokenizer, student_model, dataset, split, device):
     if dist.get_rank() != 0:
         return None, None, None, None        

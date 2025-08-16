@@ -149,6 +149,14 @@ def add_hp_args(parser: argparse.ArgumentParser):
     group.add_argument("--adaptive-kl-alpha", type=float, default=0.5)
     group.add_argument("--skew-lambda", type=float, default=0.1)
 
+    # FKD hyperparameters
+    group.add_argument("--fkd-k", type=int, default=4, help="Top-k teacher layers to focus on")
+    group.add_argument("--fkd-alpha", type=float, default=1.0, help="Weight for CE loss")
+    group.add_argument("--fkd-beta", type=float, default=1.0, help="Weight for distillation loss (1-cos)")
+    group.add_argument("--fkd-gamma", type=float, default=0.1, help="Weight for contrastive loss")
+    group.add_argument("--fkd-contrastive-temp", type=float, default=0.07, help="Temperature for InfoNCE")
+    group.add_argument("--fkd-calib-max-batches", type=int, default=0, help="Limit number of batches for BI pre-pass (0 = all)")
+
     group.add_argument('--warmup-iters', type=int, default=0,
                        help='percentage of data to warmup on (.01 = 1% of all '
                        'training iters). Default 0.01')
@@ -161,15 +169,7 @@ def add_hp_args(parser: argparse.ArgumentParser):
     group.add_argument("--scheduler-name", type=str, default="constant_trm")
 
 
-    # ---------------- EAADP (Enhanced Attention Alignment with Dynamic Projection) ----------------
-    group.add_argument("--eaadp-top-k", type=int, default=3, help="Số layer top-k dùng trong EAS")
-    group.add_argument("--eaadp-attn-lr", type=float, default=1e-4, help="LR riêng cho trọng số attention (nếu tối ưu ngoài)")
-    group.add_argument("--eaadp-main-lr", type=float, default=2e-5, help="LR phần student + DPL (nếu dùng riêng)")
-    group.add_argument("--eaadp-alpha", type=float, default=0.5, help="Hệ số pha CE vs CCL: loss = alpha*CE + (1-alpha)*CCL")
-    group.add_argument("--eaadp-max-cis-batches", type=int, default=0, help="Giới hạn batch để tính CIS nội tuyến (0 = chỉ batch đầu)")
-    group.add_argument("--eaadp-use-batch-cis", action="store_true", help="Dùng CIS theo batch thay vì pass toàn bộ tập.")
-    group.add_argument("--eaadp-cis-use-attn", action="store_true", help="Tính CIS dựa trên attention (attn_probs @ hidden) thay vì chỉ hidden states.")
-    # -----------------------------------------------------------------------------------------------
+    # EAADP args removed per FKD method focus
     return parser
 
 

@@ -17,13 +17,10 @@ from peft import (
 )
 from Classification.utils import log_rank
 from huggingface_hub import login
+from Classification.criterions.eaadp_modules import EnhancedAttentionSelector, DynamicProjectionLayer, TALFLoss
 
-hf_token = os.getenv("HF_TOKEN", None)
-if hf_token:
-    try:
-        login(token=hf_token)
-    except Exception:
-        pass
+token = os.getenv("")
+login(token=token)
 
 
 class Distiller(nn.Module):
@@ -37,10 +34,34 @@ class Distiller(nn.Module):
             self.teacher_model, self.teacher_tokenizers = self.load_teacher_model()
         else:
             self.teacher_model, self.teacher_tokenizers = None, {}
-        if self.teacher_model and self.args.projector_config_path:
+        if self.teacher_model and args.projector_config_path:
             self.set_and_load_existing_projectors()
             log_rank(f"projector structure: {self.projectors}")
-    # FKD uses projectors only (t2s recommended). No EAADP modules.
+
+        # ---------------- EAADP init (tạo module sớm để optimizer gom tham số) ----------------
+        if getattr(args, "criterion", None) == "eaadp":
+            if self.teacher_model is None:
+                raise ValueError("EAADP requires a teacher_model. Set --teacher-model-path or related args.")
+            
+            t_layers = self.teacher_model.config.num_hidden_layers
+            self.teacher_hidden_size = getattr(self, "teacher_hidden_size", self.teacher_model.config.hidden_size)
+            s_layers = self.student_model.config.num_hidden_layers
+            dummy_t = [1.0] * t_layers
+            dummy_s = [1.0] * s_layers
+            top_k = getattr(args, "eaadp_top_k", 3)
+            
+            self.eas = EnhancedAttentionSelector(
+                teacher_num_layers=len(dummy_t),
+                student_num_layers=len(dummy_s),
+                teacher_cis=dummy_t,
+                student_cis=dummy_s,
+                k=min(top_k, len(dummy_t), len(dummy_s))
+            )
+
+            self.dpl = DynamicProjectionLayer(self.teacher_hidden_size, self.hidden_size)
+            self.talf = TALFLoss()
+            self.eaadp_cis_updated = False
+        # ---------------------------------------------------------------------------------------
 
     
     def load_tokenizer(self, path):
@@ -120,15 +141,19 @@ class Distiller(nn.Module):
         else:
             raise NotImplementedError("Invalid model_dtype for f`{self.args.model_dtype}`")
 
-        if self.args.peft is not None: #for LLM2Vec student
+        if self.args.peft is not None: #for LLM2Vec
             if self.args.peft == "lora":
                 config = AutoConfig.from_pretrained("McGill-NLP/LLM2Vec-Mistral-7B-Instruct-v2-mntp", trust_remote_code=True)
                 config.is_model_parallel = False
+        
+                # lấy tokenizer
                 tokenizer = self.load_tokenizer("McGill-NLP/LLM2Vec-Mistral-7B-Instruct-v2-mntp")
+                
                 if hasattr(config, "n_embed"):
                     self.hidden_size = config.n_embed
                 else:
                     self.hidden_size = config.hidden_size
+        
                 config.num_labels = self.args.num_labels
                 model = AutoModelForSequenceClassification.from_pretrained(
                     "McGill-NLP/LLM2Vec-Mistral-7B-Instruct-v2-mntp",
@@ -137,24 +162,29 @@ class Distiller(nn.Module):
                     torch_dtype=self.dtype,
                     trust_remote_code=True,
                 )
+
                 model.config.pad_token_id = 2
-                # merge pretrained lora adapters (MNTP and simcse)
+                    
                 model = PeftModel.from_pretrained(
-                    model, "McGill-NLP/LLM2Vec-Mistral-7B-Instruct-v2-mntp",
-                ).merge_and_unload()
+                    model,
+                    "McGill-NLP/LLM2Vec-Mistral-7B-Instruct-v2-mntp",
+                )
+                model = model.merge_and_unload()  # This can take several minutes on cpu
+
                 model = PeftModel.from_pretrained(
                     model, "McGill-NLP/LLM2Vec-Mistral-7B-Instruct-v2-mntp-unsup-simcse"
-                ).merge_and_unload()
-                # apply new lora for fine-tuning if training
+                )
+                model = model.merge_and_unload() 
+                # Apply new LoRA adapter for fine-tuning
                 if self.args.do_train:
                     peft_config = LoraConfig(
-                        task_type=TaskType.SEQ_CLS,
+                        task_type=TaskType.SEQ_CLS,  # SEQ_CLS là hợp lý nếu đang làm classification
                         inference_mode=(not self.args.do_train),
                         r=self.args.peft_lora_r,
                         lora_alpha=self.args.peft_lora_alpha,
                         lora_dropout=self.args.peft_lora_dropout,
                         target_modules=[
-                            "q_proj", "k_proj", "v_proj", "o_proj",
+                            "q_proj", "k_proj", "v_proj", "o_proj", 
                             "gate_proj", "up_proj", "down_proj"
                         ]
                     )
@@ -279,6 +309,18 @@ class Distiller(nn.Module):
                 optimizer.add_param_group({
                     "params": [p for b in self.projectors for p in self.projectors[b].parameters()],
                 })
+        # EAADP specific parameter groups (optional separate LR for attention weights)
+        if getattr(self.args, "criterion", None) == "eaadp" and hasattr(self, "eas"):
+            # Attention weights (teacher_weights, student_weights)
+            optimizer.add_param_group({
+                "params": [p for p in self.eas.parameters() if p.requires_grad],
+                "lr": getattr(self.args, "eaadp_attn_lr", self.args.lr if hasattr(self.args, 'lr') else 1e-4)
+            })
+            # DPL + TALF + (student model already in base optimizer group outside)
+            optimizer.add_param_group({
+                "params": list(self.dpl.parameters()) + list(self.talf.parameters()),
+                "lr": getattr(self.args, "eaadp_main_lr", self.args.lr if hasattr(self.args, 'lr') else 2e-5)
+            })
         return optimizer
 
     def forward(self, criterion, batch, logging_output, loss_denom):
