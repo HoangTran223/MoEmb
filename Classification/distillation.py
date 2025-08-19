@@ -31,7 +31,6 @@ from Classification.utils import (
     all_gather,
 )
 from Classification.criterions import build_criterion
-# from rouge_metric import compute_metrics
 
 
 def prepare_dataset(args, distiller):
@@ -55,7 +54,6 @@ def prepare_dataset(args, distiller):
                 distiller.teacher_tokenizers
             )
             log_rank("Num of test data: {}".format(len(data["test"])))
-
     elif args.do_eval:
         data["test"] = DistillDataset(
             args, "test", distiller.student_tokenizer,
@@ -64,8 +62,8 @@ def prepare_dataset(args, distiller):
         log_rank("Num of test data: {}".format(len(data["test"])))
     else:
         raise ValueError("Do train and do eval must set one")
-        
     return data
+
 
 def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, optimizer: AdamW, lr_scheduler, dataset, device):
     log_rank("Start Fine-tuning")
@@ -98,7 +96,7 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
     # FKD PRE-PASS: compute Block Influence (BI) on calibration set using teacher
     # BI_l = 1 - mean(cos(X_l, Y_l)), where X_l is hidden_states[l] and Y_l is hidden_states[l+1]
 
-    if getattr(args, 'criterion', None) == 'fkd' and getattr(model.module, 'teacher_model', None) is not None:
+    if getattr(args, 'criterion', None) in ['fkd', 'fkd_a']:
         distiller = model.module  # unwrap Distiller
         if dist.get_rank() == 0:
             print("[FKD] Starting BI pre-pass on calibration set...")
@@ -255,9 +253,11 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
         if args.save_dir and (epoch + 1) % args.save_interval == 0: #save_interval = 1 then save each epoch
             #eval_interval = 1 then evaluate each epoch
             log_rank("Evaluating before saving model...")
-            eval_loss, eval_accu, eval_precision, eval_recall = evaluate(args, tokenizer, model.module.student_model, dataset["dev"], "dev", device)
             if "test" in dataset: #evaluate for test, no affect
-                _, _, _, _ = evaluate(args, tokenizer, model.module.student_model, dataset["test"], "test", device)
+                eval_loss, eval_accu, eval_precision, eval_recall = evaluate(args, tokenizer, model.module.student_model, dataset["test"], "test", device)
+            else:
+                eval_loss, eval_accu, eval_precision, eval_recall = evaluate(args, tokenizer, model.module.student_model, dataset["dev"], "dev", device)
+            
             ckpt_name = "epoch{}_step{}_loss{:.4f}".format(epoch + 1, logging_output["global_step"], eval_loss)
             save_dir_path = os.path.join(args.save_dir, ckpt_name)
             
@@ -286,7 +286,7 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
                         os.path.join(save_dir_path, "projector.pt")
                     )
                 
-                model_list.append({"path": save_dir_path, "score": eval_accu}) #store model list in term of eval_loss
+                model_list.append({"path": save_dir_path, "score": eval_accu + eval_precision + eval_recall})
                 model_list = sorted(model_list, key=lambda x: x["score"], reverse=False)
                 
                 if len(model_list) > args.keep_best_n_checkpoints:

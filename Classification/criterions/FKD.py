@@ -6,19 +6,10 @@ import torch.nn.functional as F
 class FKD(nn.Module):
     """
     FKD: Focused Knowledge Distillation
-
-    - Offline/Pre-pass: compute Block Influence (BI) scores for teacher layers on a calibration set.
-      BI_l = 1 - mean(cos(X_l, Y_l)) with Y_l the post-residual output of layer l and X_l its input.
-      Store top-k layer indices and softmax weights over BI in distiller.fkd_info.
-    - Online: total loss = alpha * CE + beta * Distill(hidden) + gamma * Contrastive(InfoNCE).
-      Distill compares fused student vs projected fused teacher (t2s) using 1 - cosine.
-      Contrastive uses in-batch negatives between fused student and fused teacher.
     """
-
     def __init__(self, args) -> None:
         super().__init__()
         self.args = args
-        # FKD hyper-params
         self.k = getattr(args, "fkd_k", 4)
         self.alpha = getattr(args, "fkd_alpha", 1.0)
         self.beta = getattr(args, "fkd_beta", 1.0)
@@ -26,7 +17,6 @@ class FKD(nn.Module):
         self.ctemp = getattr(args, "fkd_contrastive_temp", 0.07)
         self.label_smoothing = getattr(args, "label_smoothing", 0.0)
 
-    # ---------- helpers ----------
     def _ce_loss(self, logits, target):
         lprobs = torch.log_softmax(logits, dim=-1, dtype=torch.float32)
         nll_loss = -lprobs.gather(dim=-1, index=target.unsqueeze(-1)).squeeze(-1).mean()
@@ -37,24 +27,25 @@ class FKD(nn.Module):
             loss = nll_loss
         return loss
 
+    
     def _pooled(self, hs, attn_mask, is_encoder_like=True):
-        """
-        Pool hidden states to a single vector per sample.
-        - For encoder-like (e.g., BERT): use [CLS] token (index 0).
-        - For decoder-like (e.g., Mistral): use last non-masked token.
+        """ Rút gọn chuỗi hidden states thành 1 vector cho mỗi sample trong batch
+        - Với encoder-like (e.g., BERT): sử dụng [CLS] token.
+        - Với decoder-like (e.g., Mistral): sử dụng hidden state của token cuối cùng ko phải padding trong mỗi sequence
+        - hs[batch_size, seq_length, hidden_dim]
+        - attn_mask[batch_size, seq_length] \in {0, 1}
         """
         if is_encoder_like:
             return hs[:, 0, :]
         # decoder-like: pick last valid token per sample
         if attn_mask is None:
-            # fallback to last token
             return hs[:, -1, :]
         lengths = attn_mask.long().sum(dim=-1) - 1  # last index
         batch_indices = torch.arange(hs.size(0), device=hs.device)
         return hs[batch_indices, lengths.clamp(min=0), :]
 
     def _map_teacher_to_student_layers(self, t_idx_list, t_layers, s_layers):
-        """Map teacher layer indices to student layer indices by depth proportion."""
+        """Ánh xạ index layer của teacher sang student theo depth ratio"""
         mapped = []
         for l in t_idx_list:
             ratio = (l + 1) / float(t_layers)
@@ -72,11 +63,9 @@ class FKD(nn.Module):
         targets = torch.arange(q.size(0), device=q.device)
         return F.cross_entropy(logits, targets)
 
-    # ---------- forward ----------
     def forward(self, distiller, input_data, output_data, logging_output, batch_denom):
         student = distiller.student_model
         teacher = distiller.teacher_model
-        assert teacher is not None, "FKD requires a teacher model."
 
         outputs = student(
             input_data["input_ids"],
@@ -85,7 +74,7 @@ class FKD(nn.Module):
             return_dict=True,
         )
         logits = outputs.logits
-        ce = self._ce_loss(logits, output_data["labels"])  # scalar
+        ce = self._ce_loss(logits, output_data["labels"]) 
 
         with torch.no_grad():
             teacher.eval()
@@ -96,24 +85,17 @@ class FKD(nn.Module):
                 return_dict=True,
             )
 
-        # layer sets
-        hs_s = outputs.hidden_states  # tuple(len = s_layers+1)
-        hs_t = t_out.hidden_states    # tuple(len = t_layers+1)
+        hs_s = outputs.hidden_states  
+        hs_t = t_out.hidden_states   
         t_layers = len(hs_t) - 1
         s_layers = len(hs_s) - 1
 
         # get focus indices & weights from distiller (set during pre-pass)
         fkd_info = getattr(distiller, "fkd_info", None)
-        if fkd_info is None:
-            # fallback: evenly spaced top-k, uniform weights
-            k = min(self.k, t_layers)
-            idx = torch.linspace(0, t_layers - 1, steps=k).round().long().tolist()
-            weights = torch.tensor([1.0 / k] * k, device=logits.device)
-        else:
-            idx = fkd_info["top_indices"]  # list[int]
-            bi_scores = torch.tensor(fkd_info["bi_scores"], device=logits.device, dtype=torch.float32)
-            sel_scores = bi_scores[idx]
-            weights = torch.softmax(sel_scores, dim=0)
+        idx = fkd_info["top_indices"]
+        bi_scores = torch.tensor(fkd_info["bi_scores"], device=logits.device, dtype=torch.float32)
+        sel_scores = bi_scores[idx]
+        weights = torch.softmax(sel_scores, dim=0)
 
         s_idx = self._map_teacher_to_student_layers(idx, t_layers, s_layers)
 
@@ -122,10 +104,11 @@ class FKD(nn.Module):
         t_mask = input_data.get("teacher_attention_mask", None)
         s_mask = input_data.get("attention_mask", None)
 
-        # Teacher fused then project to student space if projector exists
+        # Teacher fused then project to student space
         vec_t = 0.0
         for w, l in zip(weights, idx):
-            ht = hs_t[l + 1]  # post-residual
+            # Lấy hidden state, pool thành vector
+            ht = hs_t[l + 1]  
             pt = self._pooled(ht, t_mask, is_encoder_like=False)
             vec_t = vec_t + w * pt
         if hasattr(distiller, "projectors") and "t2s" in distiller.projectors:
@@ -137,14 +120,11 @@ class FKD(nn.Module):
             ps = self._pooled(hs, s_mask, is_encoder_like=is_encoder_student)
             vec_s = vec_s + w * ps
 
-        # distillation: cosine distance
         cos = F.cosine_similarity(vec_s, vec_t, dim=-1)
         l_distill = (1.0 - cos).mean()
 
-        # contrastive InfoNCE
+        # Student vector gần teacher vector đúng của mình, xa teacher vector của các samples khác
         l_contrast = self._info_nce(vec_s, vec_t)
 
         total = self.alpha * ce + self.beta * l_distill + self.gamma * l_contrast
-
-        # minimal logging
         return total, logging_output

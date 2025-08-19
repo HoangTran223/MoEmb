@@ -31,6 +31,8 @@ class Distiller(nn.Module):
         super(Distiller, self).__init__()
         self.args = args
         self.device = device
+        # ensure a container for optional projectors exists early
+        self.projectors = nn.ModuleDict()
         self.student_model, self.student_tokenizer = self.load_student_model()
         
         if self.args.teacher_model_path is not None:
@@ -40,6 +42,12 @@ class Distiller(nn.Module):
         if self.teacher_model and self.args.projector_config_path:
             self.set_and_load_existing_projectors()
             log_rank(f"projector structure: {self.projectors}")
+        # Pre-create W_q for FKD_A so optimizer captures its params
+        if getattr(self.args, 'criterion', None) in ['fkd_a'] and self.teacher_model is not None:
+            in_dim = getattr(self, 'teacher_hidden_size', None) or getattr(self, 'hidden_size', None)
+            out_dim = getattr(self, 'hidden_size', None) or in_dim
+            if 'W_q' not in self.projectors and in_dim is not None and out_dim is not None:
+                self.projectors['W_q'] = nn.Linear(in_dim, out_dim)
     # FKD uses projectors only (t2s recommended). No EAADP modules.
 
     
@@ -264,7 +272,7 @@ class Distiller(nn.Module):
         return teacher_model, tokenizer
     
     def add_optimizer_param_group(self, optimizer):
-        if hasattr(self, "projectors"):
+        if hasattr(self, "projectors") and len(self.projectors) > 0:
             if self.args.projector_lr:
                 pretrained_proj = self.args.pretrained_projector.split(",") if self.args.pretrained_projector is not None else []
                 optimizer.add_param_group({
