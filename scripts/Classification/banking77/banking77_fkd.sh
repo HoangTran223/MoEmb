@@ -71,7 +71,7 @@ OPTS+=" --projector-lr ${PROJECTOR_LR}"
 OPTS+=" --projector-config-path ${PROJECTOR_CONFIG_PATH}"
 
 OPTS+=" --gradient-checkpointing"
-OPTS+=" --data-dir ${BASE_PATH}/dataset/data/patent/"
+OPTS+=" --data-dir ${BASE_PATH}/dataset/data/banking77/"
 OPTS+=" --num-workers 0"
 OPTS+=" --dev-num 1000"
 OPTS+=" --num-labels ${NUM_LABELS}"
