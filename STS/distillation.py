@@ -1,8 +1,7 @@
 import time
 import os
-
-from scipy.stats import pearsonr, spearmanr
-
+from sklearn.metrics import precision_score, recall_score, precision_recall_fscore_support
+from tqdm import tqdm as _tqdm
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -22,7 +21,7 @@ from transformers import (
 from transformers.integrations import HfDeepSpeedConfig
 from STS.arguments import get_args
 from STS.distiller import Distiller
-from STS.data_utils.distill_datasets import STSDataset
+from STS.data_utils.distill_datasets import DistillDataset
 from STS.utils import (
     initialize,
     get_optimizer, 
@@ -33,40 +32,38 @@ from STS.utils import (
 )
 from STS.criterions import build_criterion
 
-torch.set_num_threads(4) # limit the number of threads used by torch for cpu
 
 def prepare_dataset(args, distiller):
     data = {}
     if args.do_train:
-        data["train"] = STSDataset(
+        data["train"] = DistillDataset(
             args, "train", distiller.student_tokenizer,
             distiller.teacher_tokenizers
         )
         log_rank("Num of train data: {}".format(len(data["train"])))
         
-        data["dev"] = STSDataset(
+        data["dev"] = DistillDataset(
             args, "dev", distiller.student_tokenizer,
             distiller.teacher_tokenizers
         )
         log_rank("Num of dev data: {}".format(len(data["dev"])))
 
         if os.path.exists(os.path.join(args.data_dir, "test.csv")):
-            data["test"] = STSDataset(
+            data["test"] = DistillDataset(
                 args, "test", distiller.student_tokenizer,
                 distiller.teacher_tokenizers
             )
             log_rank("Num of test data: {}".format(len(data["test"])))
-
     elif args.do_eval:
-        data["test"] = STSDataset(
+        data["test"] = DistillDataset(
             args, "test", distiller.student_tokenizer,
             distiller.teacher_tokenizers
         )
         log_rank("Num of test data: {}".format(len(data["test"])))
     else:
         raise ValueError("Do train and do eval must set one")
-        
     return data
+
 
 def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, optimizer: AdamW, lr_scheduler, dataset, device):
     log_rank("Start Fine-tuning")
@@ -94,6 +91,99 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
         num_workers=args.num_workers, 
         collate_fn=dataset["train"].collate
     )
+
+    # ------------------------------------------------------------------
+    # FKD PRE-PASS: compute Block Influence (BI) on calibration set using teacher
+    # BI_l = 1 - mean(cos(X_l, Y_l)), where X_l is hidden_states[l] and Y_l is hidden_states[l+1]
+
+    if getattr(args, 'criterion', None) in ['fkd', 'fkd_a']:
+        distiller = model.module  # unwrap Distiller
+        if dist.get_rank() == 0:
+            print("[FKD] Starting BI pre-pass on calibration set...")
+
+        pre_sampler = DistributedSampler(
+            dataset['train'], shuffle=False, drop_last=False,
+            rank=dp_rank, num_replicas=dp_world_size
+        )
+        pre_loader = DataLoader(
+            dataset['train'], sampler=pre_sampler,
+            batch_size=args.eval_batch_size or args.batch_size, num_workers=args.num_workers,
+            collate_fn=dataset['train'].collate
+        )
+        teacher = distiller.teacher_model
+        teacher.eval()
+
+        bi_sums = None
+        token_counts = None
+        max_batches = getattr(args, 'fkd_calib_max_batches', 0)
+        it = 0
+        iterator = pre_loader
+        if dist.get_rank() == 0:
+            iterator = _tqdm(pre_loader, desc="FKD BI pre-pass", dynamic_ncols=True)
+        with torch.no_grad():
+            for input_batch, output_batch in iterator:
+                dataset['train'].move_to_device([input_batch, output_batch], device)
+                t_out = teacher(
+                    input_batch["teacher_input_ids"],
+                    attention_mask=input_batch.get("teacher_attention_mask", None),
+                    output_hidden_states=True,
+                    return_dict=True,
+                )
+                hs = t_out.hidden_states  # tuple len L+1
+                L = len(hs) - 1
+                if bi_sums is None:
+                    bi_sums = torch.zeros(L, device=device, dtype=torch.float64)
+                    token_counts = torch.zeros(L, device=device, dtype=torch.float64)
+                mask = input_batch.get("teacher_attention_mask", None)
+                if mask is not None:
+                    mask = mask.to(device=device, dtype=torch.float32)
+                for l in range(L):
+                    X = hs[l]      # (B, T, H)
+                    Y = hs[l+1]    # (B, T, H)
+                    cos = F.cosine_similarity(X, Y, dim=-1)  # (B, T)
+                    bi = 1.0 - cos
+                    if mask is not None:
+                        bi = bi * mask
+                        count = mask.sum()
+                    else:
+                        count = torch.tensor(bi.numel(), device=device, dtype=torch.float32)
+                    bi_sums[l] += bi.sum(dtype=torch.float64)
+                    token_counts[l] += count.to(torch.float64)
+                it += 1
+                if max_batches and it >= max_batches:
+                    break
+        # reduce across ranks
+        dist.all_reduce(bi_sums, op=dist.ReduceOp.SUM)
+        dist.all_reduce(token_counts, op=dist.ReduceOp.SUM)
+        bi_scores = (bi_sums / token_counts.clamp(min=1.0)).to(torch.float32)
+        # top-k select
+        k = min(getattr(args, 'fkd_k', 4), bi_scores.numel())
+        sorted_vals, sorted_idx = torch.sort(bi_scores, descending=True)
+        top_idx = sorted_idx[:k].tolist()
+        # store to distiller
+        distiller.fkd_info = {
+            "bi_scores": bi_scores.detach().cpu().tolist(),
+            "top_indices": top_idx,
+        }
+        if dist.get_rank() == 0:
+            printable = [(int(i), float(bi_scores[i].item())) for i in sorted_idx.tolist()]
+            print("[FKD] BI scores (desc):", printable)
+            print(f"[FKD] Selected top-{k} layers:", top_idx)
+        # recreate training sampler with shuffle
+        sampler = DistributedSampler(
+            dataset["train"], 
+            shuffle=True, 
+            drop_last=True, 
+            rank=dp_rank, 
+            num_replicas=dp_world_size
+        )
+        train_loader = DataLoader(
+            dataset['train'], 
+            sampler=sampler, 
+            batch_size=args.batch_size, 
+            num_workers=args.num_workers, 
+            collate_fn=dataset["train"].collate
+        )
     
     step = 0
     model_list = []
@@ -101,9 +191,9 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
         "epoch": 0,
         "global_step": 0,
         "loss": [], 
-        "pearson": [],
-        "spearman": [],
+        "nll_loss": [],
         "kd_loss": [],
+        "accuracy": [],
         "micro_step_time": [],
         "step_time": []
     }
@@ -144,14 +234,14 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
             
             model.backward(loss)
             model.step()
-            torch.cuda.synchronize()  # correctly compute time
+            torch.cuda.synchronize()  # correctlyc compute time
 
             elapsed_time = time.time() - st_time
             num_samples = input_batch["input_ids"].size(0)
             total_samples += num_samples
             total_time += elapsed_time
             step += 1
-
+            
             logging_output["global_step"] += 1
             logging_output["micro_step_time"].append(elapsed_time)
             logging_output["step_time"].append(elapsed_time)
@@ -161,25 +251,34 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
 
 
         if args.save_dir and (epoch + 1) % args.save_interval == 0: #save_interval = 1 then save each epoch
-            #eval_interval = 1 then evaluate each epoch            
+            #eval_interval = 1 then evaluate each epoch
+            log_rank("Evaluating before saving model...")
+            if "test" in dataset: #evaluate for test, no affect
+                eval_loss, eval_accu, eval_precision, eval_recall = evaluate(args, tokenizer, model.module.student_model, dataset["test"], "test", device)
+            else:
+                eval_loss, eval_accu, eval_precision, eval_recall = evaluate(args, tokenizer, model.module.student_model, dataset["dev"], "dev", device)
+            
+            ckpt_name = "epoch{}_step{}_loss{:.4f}".format(epoch + 1, logging_output["global_step"], eval_loss)
+            save_dir_path = os.path.join(args.save_dir, ckpt_name)
+            
             if dist.get_rank() == 0:
-
-                log_rank("Evaluating before saving model...")
-                eval_loss, eval_pearson, eval_spearman = evaluate(args, tokenizer, model.module.student_model, dataset["dev"], "dev", device)
-                if "test" in dataset: #evaluate for test, no affect
-                    _, _, _ = evaluate(args, tokenizer, model.module.student_model, dataset["test"], "test", device)
-                ckpt_name = f"epoch{epoch + 1}_step{logging_output['global_step']}_loss{eval_loss:.4f}_pearson{eval_pearson:.4f}"
-                save_dir_path = os.path.join(args.save_dir, ckpt_name)
-
                 os.makedirs(save_dir_path, exist_ok=True)
                 if not args.only_save_projector:
                     log_rank("Saving tokenizer...")
                     tokenizer.save_pretrained(save_dir_path)
                     log_rank("Saving model...")
                     model.module.student_model.save_pretrained(save_dir_path, safe_serialization=False)
+                    classifier_path = os.path.join(save_dir_path, "classifier_head.bin")
+                    if hasattr(model.module.student_model, 'score'):  # Mistral model
+                        log_rank("Saving Mistral classifier head (score)...")
+                        torch.save(model.module.student_model.score.state_dict(), classifier_path)
+                    elif hasattr(model.module.student_model, 'classifier'):  # BERT model
+                        log_rank("Saving BERT classifier head (classifier)...")
+                        torch.save(model.module.student_model.classifier.state_dict(), classifier_path)
+                    else:
+                        log_rank("Warning: Could not identify classifier head structure, no classifier saved.")
                     log_rank("Saving config")
                     model.module.student_model.config.save_pretrained(save_dir_path)
-                
                 if hasattr(model.module, "projectors"):
                     log_rank("Saving projector...")
                     torch.save(
@@ -187,12 +286,11 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
                         os.path.join(save_dir_path, "projector.pt")
                     )
                 
-                # Use Pearson correlation as the primary metric for STS tasks
-                model_list.append({"path": save_dir_path, "score": eval_pearson})
-                model_list = sorted(model_list, key=lambda x: x["score"], reverse=True)  # Higher is better
+                model_list.append({"path": save_dir_path, "score": eval_accu + eval_precision + eval_recall})
+                model_list = sorted(model_list, key=lambda x: x["score"], reverse=False)
                 
                 if len(model_list) > args.keep_best_n_checkpoints:
-                    removed_model = model_list.pop(-1)  # Remove worst model
+                    removed_model = model_list.pop(0)
                     shutil.rmtree(removed_model["path"])
 
                 log_rank(f"Model has been saved to {save_dir_path}")
@@ -208,9 +306,8 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
 @torch.no_grad()
 def evaluate(args, tokenizer, student_model, dataset, split, device):
     if dist.get_rank() != 0:
-        return None, None, None        
-    
-    # Use regular DataLoader without DistributedSampler
+        return None, None, None, None        
+
     dataloader = DataLoader(
         dataset,
         shuffle=False,
@@ -222,63 +319,63 @@ def evaluate(args, tokenizer, student_model, dataset, split, device):
     student_model.eval()
     eval_info = {
         "loss": 0.0,
-        "sample_num": 0
+        "sample_num": 0,
+        "correct_samples": 0
     }
 
     all_preds = []
-    all_targets = []
+    all_labels = []
     total_loss = 0
-    
     for input_batch, output_batch in tqdm(dataloader, desc="Processing batches"):
+
         dataset.move_to_device([input_batch, output_batch], device)
-        targets = output_batch["labels"]
-        
+        labels = output_batch["labels"]       
         outputs = student_model(
-            input_ids=input_batch["input_ids"],
+            input_batch["input_ids"],
             attention_mask=input_batch["attention_mask"],
-            token_type_ids=input_batch.get("token_type_ids", None)
+            position_ids=input_batch.get("position_ids", None),
+            labels = labels
         )
-        
-        predictions = outputs.scores 
-        # Compute MSE loss
-        loss = F.mse_loss(predictions, targets)
-        
-        all_preds.append(predictions)
-        all_targets.append(targets)
-        sample_num = targets.size(0)
-        total_loss += loss.item() * sample_num  # Scale loss by batch size for proper averaging
+        logits = outputs.logits
+        loss = outputs.loss
+
+        preds = logits.argmax(dim=-1)
+        correct = (preds == labels).sum().item()
+        all_preds.append(preds)
+        all_labels.append(labels)
+        sample_num = labels.size(0)
+        total_loss += loss
 
         eval_info["sample_num"] += sample_num
-        
-    all_preds = torch.cat(all_preds, dim=0)
-    all_targets = torch.cat(all_targets, dim=0)
+        eval_info["correct_samples"] += correct
 
-    # No need for gathering across processes
+    all_preds = torch.cat(all_preds, dim=0).cpu().numpy()
+    all_labels = torch.cat(all_labels, dim=0).cpu().numpy()
 
-    # Convert to float32 before converting to numpy (BFloat16 is not supported by numpy)
-    all_preds = all_preds.to(torch.float32)
-    all_targets = all_targets.to(torch.float32)
+    precision = precision_score(all_labels, all_preds, average='macro')
+    recall = recall_score(all_labels, all_preds, average='macro')
+    accuracy = (all_preds == all_labels).sum() / len(all_labels)
+    avg_loss = total_loss / len(all_labels)
 
-    # Convert to numpy for correlation metrics
-    all_preds_np = all_preds.cpu().numpy().flatten()
-    all_targets_np = all_targets.cpu().numpy().flatten()
 
-    # Calculate Pearson and Spearman correlations
-    pearson_correlation, _ = pearsonr(all_preds_np, all_targets_np)
-    spearman_correlation, _ = spearmanr(all_preds_np, all_targets_np)
+    eval_info["precision"] = round(precision, 6)
+    eval_info["recall"] = round(recall, 6)
+
+    eval_info["loss"] = avg_loss
+    eval_info["accuracy"] = (all_preds==all_labels).sum().item() / len(all_preds)
+    eval_info["sample_num"] = len(all_preds)
+    eval_info["correct_samples"] = (all_preds==all_labels).sum().item()
+
+    for key in eval_info:
+        if isinstance(eval_info[key], float):
+            eval_info[key] = round(eval_info[key], 6)
     
-    # Update evaluation info
-    eval_info["loss"] = float(total_loss / eval_info["sample_num"])
-    eval_info["pearson"] = round(float(pearson_correlation), 6)
-    eval_info["spearman"] = round(float(spearman_correlation), 6)
-    eval_info["mse"] = round(float(((all_preds_np - all_targets_np) ** 2).mean()), 6)
-
-    if hasattr(args, 'local_rank') and args.local_rank == 0 or not hasattr(args, 'local_rank'):
-        print(f"Evaluated: {split} | {eval_info}")
+    print(f"Evaluated: {split} | {eval_info}")
 
     student_model.train()
 
-    return eval_info["loss"], eval_info["pearson"], eval_info["spearman"]
+    return eval_info["loss"], eval_info["accuracy"], eval_info.get("precision", 0.0), eval_info.get("recall", 0.0)
+
 def main():
     torch.backends.cudnn.enabled = False
     args = get_args()
@@ -287,7 +384,6 @@ def main():
 
     # save arguments
     if dist.get_rank() == 0:
-        os.makedirs(args.save_dir, exist_ok=True)
         with open(os.path.join(args.save_dir, "args.json"), "w") as f:
             json.dump(vars(args), f)
     
@@ -339,9 +435,11 @@ def main():
     
     if args.do_train:
         finetune(args, distiller.student_tokenizer, model_engine, optimizer, lr_scheduler, dataset, device)
-       
     if args.do_eval:
-        evaluate(args, distiller.student_tokenizer, model_engine.module.student_model, dataset["test"], "test", device)
+        if "test" in dataset and len(dataset["test"]) > 0:
+            evaluate(args, distiller.student_tokenizer, model_engine.module.student_model, dataset["test"], "test", device)
+        else:
+            log_rank("No test split found. Skipping evaluation phase.")
         
     
 if __name__ == "__main__":

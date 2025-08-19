@@ -1,8 +1,7 @@
 import time
 import os
-
 from sklearn.metrics import precision_score, recall_score, precision_recall_fscore_support
-
+from tqdm import tqdm as _tqdm
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -32,9 +31,7 @@ from SentencePair.utils import (
     all_gather,
 )
 from SentencePair.criterions import build_criterion
-# from rouge_metric import compute_metrics
 
-torch.set_num_threads(4) # giới hạn số lượng thread torch sử dụng cho cpu
 
 def prepare_dataset(args, distiller):
     data = {}
@@ -57,7 +54,6 @@ def prepare_dataset(args, distiller):
                 distiller.teacher_tokenizers
             )
             log_rank("Num of test data: {}".format(len(data["test"])))
-
     elif args.do_eval:
         data["test"] = DistillDataset(
             args, "test", distiller.student_tokenizer,
@@ -66,8 +62,8 @@ def prepare_dataset(args, distiller):
         log_rank("Num of test data: {}".format(len(data["test"])))
     else:
         raise ValueError("Do train and do eval must set one")
-        
     return data
+
 
 def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, optimizer: AdamW, lr_scheduler, dataset, device):
     log_rank("Start Fine-tuning")
@@ -95,6 +91,99 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
         num_workers=args.num_workers, 
         collate_fn=dataset["train"].collate
     )
+
+    # ------------------------------------------------------------------
+    # FKD PRE-PASS: compute Block Influence (BI) on calibration set using teacher
+    # BI_l = 1 - mean(cos(X_l, Y_l)), where X_l is hidden_states[l] and Y_l is hidden_states[l+1]
+
+    if getattr(args, 'criterion', None) in ['fkd', 'fkd_a']:
+        distiller = model.module  # unwrap Distiller
+        if dist.get_rank() == 0:
+            print("[FKD] Starting BI pre-pass on calibration set...")
+
+        pre_sampler = DistributedSampler(
+            dataset['train'], shuffle=False, drop_last=False,
+            rank=dp_rank, num_replicas=dp_world_size
+        )
+        pre_loader = DataLoader(
+            dataset['train'], sampler=pre_sampler,
+            batch_size=args.eval_batch_size or args.batch_size, num_workers=args.num_workers,
+            collate_fn=dataset['train'].collate
+        )
+        teacher = distiller.teacher_model
+        teacher.eval()
+
+        bi_sums = None
+        token_counts = None
+        max_batches = getattr(args, 'fkd_calib_max_batches', 0)
+        it = 0
+        iterator = pre_loader
+        if dist.get_rank() == 0:
+            iterator = _tqdm(pre_loader, desc="FKD BI pre-pass", dynamic_ncols=True)
+        with torch.no_grad():
+            for input_batch, output_batch in iterator:
+                dataset['train'].move_to_device([input_batch, output_batch], device)
+                t_out = teacher(
+                    input_batch["teacher_input_ids"],
+                    attention_mask=input_batch.get("teacher_attention_mask", None),
+                    output_hidden_states=True,
+                    return_dict=True,
+                )
+                hs = t_out.hidden_states  # tuple len L+1
+                L = len(hs) - 1
+                if bi_sums is None:
+                    bi_sums = torch.zeros(L, device=device, dtype=torch.float64)
+                    token_counts = torch.zeros(L, device=device, dtype=torch.float64)
+                mask = input_batch.get("teacher_attention_mask", None)
+                if mask is not None:
+                    mask = mask.to(device=device, dtype=torch.float32)
+                for l in range(L):
+                    X = hs[l]      # (B, T, H)
+                    Y = hs[l+1]    # (B, T, H)
+                    cos = F.cosine_similarity(X, Y, dim=-1)  # (B, T)
+                    bi = 1.0 - cos
+                    if mask is not None:
+                        bi = bi * mask
+                        count = mask.sum()
+                    else:
+                        count = torch.tensor(bi.numel(), device=device, dtype=torch.float32)
+                    bi_sums[l] += bi.sum(dtype=torch.float64)
+                    token_counts[l] += count.to(torch.float64)
+                it += 1
+                if max_batches and it >= max_batches:
+                    break
+        # reduce across ranks
+        dist.all_reduce(bi_sums, op=dist.ReduceOp.SUM)
+        dist.all_reduce(token_counts, op=dist.ReduceOp.SUM)
+        bi_scores = (bi_sums / token_counts.clamp(min=1.0)).to(torch.float32)
+        # top-k select
+        k = min(getattr(args, 'fkd_k', 4), bi_scores.numel())
+        sorted_vals, sorted_idx = torch.sort(bi_scores, descending=True)
+        top_idx = sorted_idx[:k].tolist()
+        # store to distiller
+        distiller.fkd_info = {
+            "bi_scores": bi_scores.detach().cpu().tolist(),
+            "top_indices": top_idx,
+        }
+        if dist.get_rank() == 0:
+            printable = [(int(i), float(bi_scores[i].item())) for i in sorted_idx.tolist()]
+            print("[FKD] BI scores (desc):", printable)
+            print(f"[FKD] Selected top-{k} layers:", top_idx)
+        # recreate training sampler with shuffle
+        sampler = DistributedSampler(
+            dataset["train"], 
+            shuffle=True, 
+            drop_last=True, 
+            rank=dp_rank, 
+            num_replicas=dp_world_size
+        )
+        train_loader = DataLoader(
+            dataset['train'], 
+            sampler=sampler, 
+            batch_size=args.batch_size, 
+            num_workers=args.num_workers, 
+            collate_fn=dataset["train"].collate
+        )
     
     step = 0
     model_list = []
@@ -164,9 +253,11 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
         if args.save_dir and (epoch + 1) % args.save_interval == 0: #save_interval = 1 then save each epoch
             #eval_interval = 1 then evaluate each epoch
             log_rank("Evaluating before saving model...")
-            eval_loss, eval_accu, eval_precision, eval_recall = evaluate(args, tokenizer, model.module.student_model, dataset["dev"], "dev", device)
             if "test" in dataset: #evaluate for test, no affect
-                _, _, _, _ = evaluate(args, tokenizer, model.module.student_model, dataset["test"], "test", device)
+                eval_loss, eval_accu, eval_precision, eval_recall = evaluate(args, tokenizer, model.module.student_model, dataset["test"], "test", device)
+            else:
+                eval_loss, eval_accu, eval_precision, eval_recall = evaluate(args, tokenizer, model.module.student_model, dataset["dev"], "dev", device)
+            
             ckpt_name = "epoch{}_step{}_loss{:.4f}".format(epoch + 1, logging_output["global_step"], eval_loss)
             save_dir_path = os.path.join(args.save_dir, ckpt_name)
             
@@ -195,7 +286,7 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
                         os.path.join(save_dir_path, "projector.pt")
                     )
                 
-                model_list.append({"path": save_dir_path, "score": eval_accu}) #store model list in term of eval_loss
+                model_list.append({"path": save_dir_path, "score": eval_accu + eval_precision + eval_recall})
                 model_list = sorted(model_list, key=lambda x: x["score"], reverse=False)
                 
                 if len(model_list) > args.keep_best_n_checkpoints:
@@ -212,7 +303,7 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
         int(total_seconds % 60)
     ))
 
-@torch.no_grad
+@torch.no_grad()
 def evaluate(args, tokenizer, student_model, dataset, split, device):
     if dist.get_rank() != 0:
         return None, None, None, None        

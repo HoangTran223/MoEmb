@@ -351,7 +351,7 @@ def get_learning_rate_scheduler(args, optimizer):
     if args.total_iters is None:
         args.total_iters = args.train_iters_per_epoch * args.num_epochs
 
-    print(f'get_learning_rate_scheduler total_iters: {args.total_iters} warmup_iters {args.warmup_iters}')
+    print(f'get_learning_rate_scheduler total_iters: {args.total_iters}')
 
     if args.lr_decay_style == "constant":
         lr_scheduler = get_constant_schedule_with_warmup(

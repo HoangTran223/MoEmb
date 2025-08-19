@@ -15,19 +15,15 @@ from peft import (
     TaskType,
     get_peft_model
 )
-from utils import log_rank
+from SentencePair.utils import log_rank
 from huggingface_hub import login
-import torch.distributed as dist
-import os
-def _hf_login_if_available():
-    token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
-    if token:
-        try:
-            login(token=token)
-        except Exception:
-            pass
 
-_hf_login_if_available()
+hf_token = os.getenv("HF_TOKEN", None)
+if hf_token:
+    try:
+        login(token=hf_token)
+    except Exception:
+        pass
 
 
 class Distiller(nn.Module):
@@ -35,42 +31,25 @@ class Distiller(nn.Module):
         super(Distiller, self).__init__()
         self.args = args
         self.device = device
+        # ensure a container for optional projectors exists early
+        self.projectors = nn.ModuleDict()
         self.student_model, self.student_tokenizer = self.load_student_model()
         
         if self.args.teacher_model_path is not None:
             self.teacher_model, self.teacher_tokenizers = self.load_teacher_model()
         else:
             self.teacher_model, self.teacher_tokenizers = None, {}
-        if self.teacher_model and args.projector_config_path:
+        if self.teacher_model and self.args.projector_config_path:
             self.set_and_load_existing_projectors()
             log_rank(f"projector structure: {self.projectors}")
+        # Pre-create W_q for FKD_A so optimizer captures its params
+        if getattr(self.args, 'criterion', None) in ['fkd_a'] and self.teacher_model is not None:
+            in_dim = getattr(self, 'teacher_hidden_size', None) or getattr(self, 'hidden_size', None)
+            out_dim = getattr(self, 'hidden_size', None) or in_dim
+            if 'W_q' not in self.projectors and in_dim is not None and out_dim is not None:
+                self.projectors['W_q'] = nn.Linear(in_dim, out_dim)
+    # FKD uses projectors only (t2s recommended). No EAADP modules.
 
-        # ---------------- EAADP init (tạo module sớm để optimizer gom tham số) ----------------
-        if getattr(args, "criterion", None) == "eaadp":
-            from SentencePair.criterions.eaadp_modules import EnhancedAttentionSelector, DynamicProjectionLayer, TALFLoss
-            # dummy CIS (sẽ cập nhật lại ở criterion forward lần đầu)
-            if self.teacher_model is not None:
-                t_layers = self.teacher_model.config.num_hidden_layers
-                self.teacher_hidden_size = getattr(self, "teacher_hidden_size", self.teacher_model.config.hidden_size)
-            else:
-                raise ValueError("EAADP cần teacher_model.")
-            s_layers = self.student_model.config.num_hidden_layers
-            dummy_t = [1.0] * t_layers
-            dummy_s = [1.0] * s_layers
-            top_k = getattr(args, "eaadp_top_k", 3)
-            self.eas = EnhancedAttentionSelector(
-                teacher_num_layers=len(dummy_t),
-                student_num_layers=len(dummy_s),
-                teacher_cis=dummy_t,
-                student_cis=dummy_s,
-                k=top_k
-            )
-            self.dpl = DynamicProjectionLayer(self.teacher_hidden_size, self.hidden_size)
-            self.talf = TALFLoss()
-            self.eaadp_cis_updated = False  # đánh dấu chưa cập nhật CIS thật
-        # ---------------------------------------------------------------------------------------
-
-    # Distiller CLI args are defined centrally in Classification/arguments.add_distiller_args
     
     def load_tokenizer(self, path):
         tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=True)
@@ -149,19 +128,15 @@ class Distiller(nn.Module):
         else:
             raise NotImplementedError("Invalid model_dtype for f`{self.args.model_dtype}`")
 
-        if self.args.peft is not None: #for LLM2Vec
+        if self.args.peft is not None: #for LLM2Vec student
             if self.args.peft == "lora":
                 config = AutoConfig.from_pretrained("McGill-NLP/LLM2Vec-Mistral-7B-Instruct-v2-mntp", trust_remote_code=True)
                 config.is_model_parallel = False
-        
-                # lấy tokenizer
                 tokenizer = self.load_tokenizer("McGill-NLP/LLM2Vec-Mistral-7B-Instruct-v2-mntp")
-                
                 if hasattr(config, "n_embed"):
                     self.hidden_size = config.n_embed
                 else:
                     self.hidden_size = config.hidden_size
-        
                 config.num_labels = self.args.num_labels
                 model = AutoModelForSequenceClassification.from_pretrained(
                     "McGill-NLP/LLM2Vec-Mistral-7B-Instruct-v2-mntp",
@@ -170,29 +145,24 @@ class Distiller(nn.Module):
                     torch_dtype=self.dtype,
                     trust_remote_code=True,
                 )
-
                 model.config.pad_token_id = 2
-                    
+                # merge pretrained lora adapters (MNTP and simcse)
                 model = PeftModel.from_pretrained(
-                    model,
-                    "McGill-NLP/LLM2Vec-Mistral-7B-Instruct-v2-mntp",
-                )
-                model = model.merge_and_unload()  # This can take several minutes on cpu
-
+                    model, "McGill-NLP/LLM2Vec-Mistral-7B-Instruct-v2-mntp",
+                ).merge_and_unload()
                 model = PeftModel.from_pretrained(
                     model, "McGill-NLP/LLM2Vec-Mistral-7B-Instruct-v2-mntp-unsup-simcse"
-                )
-                model = model.merge_and_unload() 
-                # Apply new LoRA adapter for fine-tuning
+                ).merge_and_unload()
+                # apply new lora for fine-tuning if training
                 if self.args.do_train:
                     peft_config = LoraConfig(
-                        task_type=TaskType.SEQ_CLS,  # SEQ_CLS là hợp lý nếu đang làm classification
+                        task_type=TaskType.SEQ_CLS,
                         inference_mode=(not self.args.do_train),
                         r=self.args.peft_lora_r,
                         lora_alpha=self.args.peft_lora_alpha,
                         lora_dropout=self.args.peft_lora_dropout,
                         target_modules=[
-                            "q_proj", "k_proj", "v_proj", "o_proj", 
+                            "q_proj", "k_proj", "v_proj", "o_proj",
                             "gate_proj", "up_proj", "down_proj"
                         ]
                     )
@@ -302,7 +272,7 @@ class Distiller(nn.Module):
         return teacher_model, tokenizer
     
     def add_optimizer_param_group(self, optimizer):
-        if hasattr(self, "projectors"):
+        if hasattr(self, "projectors") and len(self.projectors) > 0:
             if self.args.projector_lr:
                 pretrained_proj = self.args.pretrained_projector.split(",") if self.args.pretrained_projector is not None else []
                 optimizer.add_param_group({
@@ -322,11 +292,4 @@ class Distiller(nn.Module):
     def forward(self, criterion, batch, logging_output, loss_denom):
         input_data = batch["input_batch"]
         output_data = batch["output_batch"]
-        loss, logging_output = criterion(
-            self,
-            input_data, 
-            output_data,
-            logging_output,
-            loss_denom,
-        )
-        return loss, logging_output
+        return criterion(self, input_data, output_data, logging_output, loss_denom)

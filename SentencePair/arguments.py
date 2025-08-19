@@ -17,7 +17,6 @@ import argparse
 import os
 import deepspeed
 import numpy as np
-from Classification.arguments import add_distiller_args
 
 
 def add_model_args(parser: argparse.ArgumentParser):
@@ -70,6 +69,11 @@ def add_runtime_args(parser: argparse.ArgumentParser):
     group.add_argument("--report-logits", action="store_true")
     group.add_argument("--only-save-projector", action="store_true")
     group.add_argument("--debug", action="store_true")
+    # Thêm các tham số mới cho evaluation
+    group.add_argument("--checkpoint-path", type=str, default=None,
+                     help='Đường dẫn đến checkpoint cần đánh giá')
+    group.add_argument("--overwrite-results", action="store_true",
+                     help='Ghi đè kết quả evaluation nếu đã tồn tại')
     return parser
 
 
@@ -145,6 +149,14 @@ def add_hp_args(parser: argparse.ArgumentParser):
     group.add_argument("--adaptive-kl-alpha", type=float, default=0.5)
     group.add_argument("--skew-lambda", type=float, default=0.1)
 
+    # FKD hyperparameters
+    group.add_argument("--fkd-k", type=int, default=4, help="Top-k teacher layers to focus on")
+    group.add_argument("--fkd-alpha", type=float, default=1.0, help="Weight for CE loss")
+    group.add_argument("--fkd-beta", type=float, default=1.0, help="Weight for distillation loss (1-cos)")
+    group.add_argument("--fkd-gamma", type=float, default=0.1, help="Weight for contrastive loss")
+    group.add_argument("--fkd-contrastive-temp", type=float, default=0.07, help="Temperature for InfoNCE")
+    group.add_argument("--fkd-calib-max-batches", type=int, default=0, help="Limit number of batches for BI pre-pass (0 = all)")
+
     group.add_argument('--warmup-iters', type=int, default=0,
                        help='percentage of data to warmup on (.01 = 1% of all '
                        'training iters). Default 0.01')
@@ -157,14 +169,7 @@ def add_hp_args(parser: argparse.ArgumentParser):
     group.add_argument("--scheduler-name", type=str, default="constant_trm")
 
 
-    # ---------------- EAADP (Enhanced Attention Alignment with Dynamic Projection) ----------------
-    group.add_argument("--eaadp-top-k", type=int, default=3, help="Số layer top-k dùng trong EAS")
-    group.add_argument("--eaadp-attn-lr", type=float, default=1e-4, help="LR riêng cho trọng số attention (nếu tối ưu ngoài)")
-    group.add_argument("--eaadp-main-lr", type=float, default=2e-5, help="LR phần student + DPL (nếu dùng riêng)")
-    group.add_argument("--eaadp-alpha", type=float, default=0.5, help="Hệ số pha CE vs CCL: loss = alpha*CE + (1-alpha)*CCL")
-    group.add_argument("--eaadp-max-cis-batches", type=int, default=0, help="Giới hạn batch để tính CIS nội tuyến (0 = chỉ batch đầu)")
-    group.add_argument("--eaadp-use-batch-cis", action="store_true", help="Dùng CIS theo batch thay vì pass toàn bộ tập.")
-    # -----------------------------------------------------------------------------------------------
+    # EAADP args removed per FKD method focus
     return parser
 
 
@@ -194,6 +199,30 @@ def add_peft_args(parser: argparse.ArgumentParser):
     group.add_argument("--peft-path", type=str, default=None)
     group.add_argument("--teacher-peft-name", type=str, default=None)
     group.add_argument("--teacher-peft-path", type=str, default=None)
+    return parser
+
+def add_distiller_args(parser: argparse.ArgumentParser):
+    group = parser.add_argument_group("distiller", "distiller configurations")
+    group.add_argument("--projector-config-path", type=str, default=None,
+                       help='path to projector_config.json')
+    group.add_argument("--projector-path", type=str, default=None,
+                       help='path to pretrained projector')
+    group.add_argument("--projector-lr", type=float, default=0.001,
+                       help='learning rate only for projection')
+    group.add_argument("--pretrained-projector", type=str, default=None,
+                       help='pretrained projector name')
+    group.add_argument("--pretrained-projector-lr", type=float, default=0.001,
+                       help='learning rate only for pretrained projector')
+    group.add_argument("--vocab-alignment-path", type=str, default=None,
+                       help='path for the vocab alignment file')
+    group.add_argument("--teacher-to-student-token-mapping", type=str, default=None,
+                       help='path for the vocab alignment file (token, teacher-to-student)')
+    group.add_argument("--teacher-to-student-id-mapping", type=str, default=None,
+                       help='path for the vocab alignment file (id, teacher-to-student)')
+    group.add_argument("--student-to-teacher-token-mapping", type=str, default=None,
+                       help='path for the vocab alignment file (token, student-to-teacher)')
+    group.add_argument("--student-to-teacher-id-mapping", type=str, default=None,
+                       help='path for the vocab alignment file (id, student-to-teacher)')
     return parser
 
 
