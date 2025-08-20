@@ -49,10 +49,21 @@ class FKD_A(nn.Module):
         return hs[b, lengths.clamp(min=0), :]
 
     def _map_teacher_to_student_layers(self, t_idx_list, t_layers, s_layers):
+        """
+        Deterministic mapping from teacher layer indices (0-based) to student layer indices (0-based).
+        Uses formula: s_l = floor(((l+1) * S - 1) / T), clipped to [0, S-1].
+        This preserves relative depth and avoids off-by-one issues.
+        """
         mapped = []
+        T = int(t_layers)
+        S = int(s_layers)
         for l in t_idx_list:
-            ratio = (l + 1) / float(t_layers)
-            s_l = max(0, min(s_layers - 1, int(round(ratio * s_layers)) - 1))
+            if S is None or T is None or S <= 0 or T <= 0:
+                mapped.append(None)
+                continue
+            # l is 0-based teacher layer index; compute 0-based student index
+            s_l = int(((int(l) + 1) * S - 1) // max(1, T))
+            s_l = max(0, min(S - 1, s_l))
             mapped.append(s_l)
         return mapped
 
@@ -161,6 +172,17 @@ class FKD_A(nn.Module):
         attn = torch.softmax(scores / (s_dim ** 0.5), dim=1)
         # fuse student
         H_S_fused = torch.einsum("bk,bkh->bh", attn, V)
+
+        # Store attention weights for logging - average across batch
+        # attn shape: [B, K] -> mean to [K]
+        attn_weights_mean = attn.detach().mean(dim=0).cpu().tolist()  # [K]
+        
+        # Store in distiller for access during training loop
+        if not hasattr(distiller, 'current_student_attn_weights'):
+            distiller.current_student_attn_weights = {}
+        # Map to corresponding student layer indices
+        for i, s_l in enumerate(s_idx):
+            distiller.current_student_attn_weights[s_l] = attn_weights_mean[i]
 
         # use teacher fused in student space for matching
         H_T_fused = vec_t_proj
