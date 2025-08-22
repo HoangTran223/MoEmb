@@ -1,3 +1,176 @@
+def finetune(args, tokenizer, model, optimizer, lr_scheduler, dataset, device):
+    log_rank("Start Fine-tuning")
+    start_time = time.time()
+    dp_world_size = dist.get_world_size()
+    dp_rank = dist.get_rank()
+    criterion = build_criterion(args)
+
+    sampler = DistributedSampler(
+        dataset["train"],
+        shuffle=True,
+        drop_last=True,
+        rank=dp_rank,
+        num_replicas=dp_world_size
+    )
+    train_loader = DataLoader(
+        dataset['train'],
+        sampler=sampler,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        collate_fn=dataset["train"].collate
+    )
+
+    step = 0
+    model_list = []
+    logging_output = {
+        "epoch": 0,
+        "global_step": 0,
+        "loss": [],
+        "pearson": [],
+        "spearman": [],
+        "micro_step_time": [],
+        "step_time": []
+    }
+
+    for epoch in range(args.num_epochs):
+        sampler.set_epoch(epoch)
+        logging_output["epoch"] += 1
+        log_rank(f"Start iterations of epoch {epoch + 1}")
+        model.train()
+        epoch_start_time = time.time()
+        step = 0
+        total_samples = 0
+        total_time = 0.0
+        data_iter = train_loader
+        if dist.get_rank() == 0:
+            data_iter = tqdm(train_loader, desc=f"Epoch {epoch}", dynamic_ncols=True)
+        for batch in data_iter:
+            st_time = time.time()
+            input_batch, output_batch = batch
+            dataset["train"].move_to_device([input_batch, output_batch], device)
+            loss, logging_output = model(
+                criterion,
+                {"input_batch": input_batch, "output_batch": output_batch},
+                logging_output,
+                loss_denom=1,
+            )
+            if torch.isnan(loss) or torch.isinf(loss):
+                print("⚠️ Loss is NaN or Inf. Skipping this step.")
+                continue
+            model.backward(loss)
+            model.step()
+            torch.cuda.synchronize()
+            elapsed_time = time.time() - st_time
+            num_samples = input_batch["input_ids"].size(0)
+            total_samples += num_samples
+            total_time += elapsed_time
+            step += 1
+            logging_output["global_step"] += 1
+            logging_output["micro_step_time"].append(elapsed_time)
+            logging_output["step_time"].append(elapsed_time)
+            if dist.get_rank() == 0:
+                data_iter.set_postfix(loss=loss.item())
+        # Log per-epoch mean attention weights of student fused layers (I_S)
+        if hasattr(model.module, 'epoch_student_attn_weights') and getattr(model.module, 'fkd_info', None) is not None and dist.get_rank() == 0:
+            save_path = os.path.join(args.save_dir, "fkd_layer_weights.json")
+            # Load or init data
+            try:
+                with open(save_path, 'r') as f:
+                    data = json.load(f)
+            except Exception:
+                data = {}
+
+            # mapped_student_layers: lấy từ file nếu có, hoặc map lại từ teacher_top_k
+            mapped_student = data.get('mapped_student_layers', None)
+            if mapped_student is None:
+                fkd_info = getattr(model.module, 'fkd_info', None)
+                if fkd_info is not None:
+                    top_idx = fkd_info.get('top_indices', [])
+                    bi_scores = fkd_info.get('bi_scores', [])
+                    t_layers = len(bi_scores)
+                    try:
+                        s_layers = getattr(model.module.student_model.config, 'num_hidden_layers', None)
+                    except Exception:
+                        s_layers = None
+                    if s_layers is None:
+                        try:
+                            s_layers = len(model.module.student_model.base_model.encoder.layer)
+                        except Exception:
+                            s_layers = None
+                    mapped_student = []
+                    for l in top_idx:
+                        if s_layers is not None:
+                            s_l = max(0, min(s_layers - 1, int(((int(l) + 1) * s_layers - 1) // max(1, t_layers))))
+                        else:
+                            s_l = None
+                        mapped_student.append(s_l)
+                    data['mapped_student_layers'] = mapped_student
+                else:
+                    mapped_student = []
+
+            # Gộp attention weights từ distiller.epoch_student_attn_weights
+            attn_accum = {str(s_l): [] for s_l in mapped_student}
+            for batch_dict in getattr(model.module, 'epoch_student_attn_weights', []):
+                for s_l, attn_list in batch_dict.items():
+                    if str(s_l) in attn_accum:
+                        attn_accum[str(s_l)].extend(attn_list)
+
+            # Tính mean attention weight cho từng student layer
+            epoch_attn_means = {}
+            for s_l in mapped_student:
+                vals = attn_accum[str(s_l)]
+                if len(vals) > 0:
+                    epoch_attn_means[str(s_l)] = float(sum(vals) / len(vals))
+                else:
+                    epoch_attn_means[str(s_l)] = None
+
+            if 'per_epoch_student_attn_weights' not in data:
+                data['per_epoch_student_attn_weights'] = {}
+            data['per_epoch_student_attn_weights'][str(epoch + 1)] = epoch_attn_means
+            with open(save_path, "w") as f:
+                json.dump(data, f, indent=2)
+            # Reset attention weights log cho epoch tiếp theo
+            model.module.epoch_student_attn_weights = []
+
+        # Validation and checkpointing
+        if args.save_dir and (epoch + 1) % args.save_interval == 0:
+            log_rank("Evaluating before saving model...")
+            if "dev" in dataset:
+                eval_loss, mse, pearson, spearman = evaluate(args, tokenizer, model.module.student_model, dataset["dev"], "dev", device)
+            elif "test" in dataset:
+                eval_loss, mse, pearson, spearman = evaluate(args, tokenizer, model.module.student_model, dataset["test"], "test", device)
+            else:
+                eval_loss, mse, pearson, spearman = None, None, None, None
+            ckpt_name = f"epoch{epoch + 1}_step{logging_output['global_step']}_loss{eval_loss:.4f}_pearson{pearson:.4f}"
+            save_dir_path = os.path.join(args.save_dir, ckpt_name)
+            if dist.get_rank() == 0:
+                os.makedirs(save_dir_path, exist_ok=True)
+                if not args.only_save_projector:
+                    log_rank("Saving tokenizer...")
+                    tokenizer.save_pretrained(save_dir_path)
+                    log_rank("Saving model...")
+                    model.module.student_model.save_pretrained(save_dir_path, safe_serialization=False)
+                    log_rank("Saving config")
+                    model.module.student_model.config.save_pretrained(save_dir_path)
+                if hasattr(model.module, "projectors"):
+                    log_rank("Saving projector...")
+                    torch.save(
+                        model.module.projectors.state_dict(),
+                        os.path.join(save_dir_path, "projector.pt")
+                    )
+                model_list.append({"path": save_dir_path, "score": pearson})
+                model_list = sorted(model_list, key=lambda x: x["score"], reverse=True)
+                if len(model_list) > args.keep_best_n_checkpoints:
+                    removed_model = model_list.pop(-1)
+                    shutil.rmtree(removed_model["path"])
+                log_rank(f"Model has been saved to {save_dir_path}")
+            dist.barrier()
+    total_seconds = time.time() - start_time
+    log_rank("Done training in {:0>2}:{:0>2}:{:0>2}".format(
+        int(total_seconds // 3600),
+        int(total_seconds % 3600 // 60),
+        int(total_seconds % 60)
+    ))
 import time
 import os
 from sklearn.metrics import precision_score, recall_score, precision_recall_fscore_support
@@ -45,13 +218,11 @@ def prepare_dataset(args, distiller):
             distiller.teacher_tokenizers
         )
         log_rank("Num of train data: {}".format(len(data["train"])))
-        
         data["dev"] = DistillDataset(
             args, "dev", distiller.student_tokenizer,
             distiller.teacher_tokenizers
         )
         log_rank("Num of dev data: {}".format(len(data["dev"])))
-
         if os.path.exists(os.path.join(args.data_dir, "test.csv")):
             data["test"] = DistillDataset(
                 args, "test", distiller.student_tokenizer,
@@ -67,34 +238,6 @@ def prepare_dataset(args, distiller):
     else:
         raise ValueError("Do train and do eval must set one")
     return data
-
-
-def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, optimizer: AdamW, lr_scheduler, dataset, device):
-    log_rank("Start Fine-tuning")
-    start_time = time.time()
-
-    if args.model_parallel:
-        raise NotImplementedError
-    else:
-        dp_world_size = dist.get_world_size()
-        dp_rank = dist.get_rank()
-        dp_group = None
-        criterion = build_criterion(args)
-
-    sampler = DistributedSampler(
-        dataset["train"], 
-        shuffle=True, 
-        drop_last=True, 
-        rank=dp_rank, 
-        num_replicas=dp_world_size
-    )
-    train_loader = DataLoader(
-        dataset['train'], 
-        sampler=sampler, 
-        batch_size=args.batch_size, 
-        num_workers=args.num_workers, 
-        collate_fn=dataset["train"].collate
-    )
 
     # ------------------------------------------------------------------
     # FKD PRE-PASS: compute Block Influence (BI) on calibration set using teacher
@@ -377,8 +520,9 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
 @torch.no_grad()
 def evaluate(args, tokenizer, student_model, dataset, split, device):
     if dist.get_rank() != 0:
-        return None, None, None, None        
+        return None, None, None, None
 
+    from scipy.stats import pearsonr, spearmanr
     dataloader = DataLoader(
         dataset,
         shuffle=False,
@@ -388,64 +532,49 @@ def evaluate(args, tokenizer, student_model, dataset, split, device):
     )
 
     student_model.eval()
-    eval_info = {
-        "loss": 0.0,
-        "sample_num": 0,
-        "correct_samples": 0
-    }
-
     all_preds = []
-    all_labels = []
+    all_targets = []
     total_loss = 0
+    sample_num = 0
+    import torch.nn.functional as F
     for input_batch, output_batch in tqdm(dataloader, desc="Processing batches"):
-
         dataset.move_to_device([input_batch, output_batch], device)
-        labels = output_batch["labels"]       
+        labels = output_batch["labels"]
         outputs = student_model(
-            input_batch["input_ids"],
+            input_ids=input_batch["input_ids"],
             attention_mask=input_batch["attention_mask"],
-            position_ids=input_batch.get("position_ids", None),
-            labels = labels
+            token_type_ids=input_batch.get("token_type_ids", None),
+            output_hidden_states=False,
+            return_dict=True,
         )
-        logits = outputs.logits
-        loss = outputs.loss
+        # For regression, logits shape: [B, 1] or [B]
+        logits = outputs.logits.squeeze(-1)
+        loss = F.mse_loss(logits, labels)
+        all_preds.append(logits.detach().cpu())
+        all_targets.append(labels.detach().cpu())
+        total_loss += loss.item() * labels.size(0)
+        sample_num += labels.size(0)
 
-        preds = logits.argmax(dim=-1)
-        correct = (preds == labels).sum().item()
-        all_preds.append(preds)
-        all_labels.append(labels)
-        sample_num = labels.size(0)
-        total_loss += loss
+    all_preds = torch.cat(all_preds, dim=0).to(torch.float32)
+    all_targets = torch.cat(all_targets, dim=0).to(torch.float32)
+    all_preds_np = all_preds.numpy().flatten()
+    all_targets_np = all_targets.numpy().flatten()
 
-        eval_info["sample_num"] += sample_num
-        eval_info["correct_samples"] += correct
+    # Compute metrics
+    mse = ((all_preds_np - all_targets_np) ** 2).mean()
+    try:
+        pearson = pearsonr(all_preds_np, all_targets_np)[0]
+    except Exception:
+        pearson = float('nan')
+    try:
+        spearman = spearmanr(all_preds_np, all_targets_np)[0]
+    except Exception:
+        spearman = float('nan')
 
-    all_preds = torch.cat(all_preds, dim=0).cpu().numpy()
-    all_labels = torch.cat(all_labels, dim=0).cpu().numpy()
-
-    precision = precision_score(all_labels, all_preds, average='macro')
-    recall = recall_score(all_labels, all_preds, average='macro')
-    accuracy = (all_preds == all_labels).sum() / len(all_labels)
-    avg_loss = total_loss / len(all_labels)
-
-
-    eval_info["precision"] = round(precision, 6)
-    eval_info["recall"] = round(recall, 6)
-
-    eval_info["loss"] = avg_loss
-    eval_info["accuracy"] = (all_preds==all_labels).sum().item() / len(all_preds)
-    eval_info["sample_num"] = len(all_preds)
-    eval_info["correct_samples"] = (all_preds==all_labels).sum().item()
-
-    for key in eval_info:
-        if isinstance(eval_info[key], float):
-            eval_info[key] = round(eval_info[key], 6)
-    
-    print(f"Evaluated: {split} | {eval_info}")
-
+    avg_loss = total_loss / sample_num if sample_num > 0 else float('nan')
+    print(f"Evaluated: {split} | loss={avg_loss:.4f} | mse={mse:.4f} | pearson={pearson:.4f} | spearman={spearman:.4f}")
     student_model.train()
-
-    return eval_info["loss"], eval_info["accuracy"], eval_info.get("precision", 0.0), eval_info.get("recall", 0.0)
+    return avg_loss, mse, pearson, spearman
 
 def main():
     torch.backends.cudnn.enabled = False

@@ -118,7 +118,6 @@ class Distiller(nn.Module):
     
     def load_student_model(self):
         log_rank("Loading student model...")
-    
         if self.args.model_dtype == "fp32":
             self.dtype = torch.float32
         elif self.args.model_dtype == "bf16":
@@ -126,18 +125,21 @@ class Distiller(nn.Module):
         elif self.args.model_dtype == "fp16":
             self.dtype = torch.float16
         else:
-            raise NotImplementedError("Invalid model_dtype for f`{self.args.model_dtype}`")
+            raise NotImplementedError(f"Invalid model_dtype for {self.args.model_dtype}")
 
-        if self.args.peft is not None: #for LLM2Vec student
+        # Always force regression for STS: num_labels=1
+        num_labels = 1
+
+        if self.args.peft is not None:  # for LLM2Vec student
             if self.args.peft == "lora":
                 config = AutoConfig.from_pretrained("McGill-NLP/LLM2Vec-Mistral-7B-Instruct-v2-mntp", trust_remote_code=True)
                 config.is_model_parallel = False
+                config.num_labels = num_labels
                 tokenizer = self.load_tokenizer("McGill-NLP/LLM2Vec-Mistral-7B-Instruct-v2-mntp")
                 if hasattr(config, "n_embed"):
                     self.hidden_size = config.n_embed
                 else:
                     self.hidden_size = config.hidden_size
-                config.num_labels = self.args.num_labels
                 model = AutoModelForSequenceClassification.from_pretrained(
                     "McGill-NLP/LLM2Vec-Mistral-7B-Instruct-v2-mntp",
                     config=config,
@@ -172,27 +174,32 @@ class Distiller(nn.Module):
                     print(f"Trainable parameters: {trainable_params}/{all_params} ({trainable_params/all_params:.2%})")
             else:
                 raise NotImplementedError
-        else: #for BERT
+        else:  # for BERT
             config = AutoConfig.from_pretrained("bert-base-uncased", trust_remote_code=True)
             config.is_model_parallel = False
-    
-            # lấy tokenizer
+            config.num_labels = num_labels
             tokenizer = self.load_tokenizer("bert-base-uncased")
-            
             if hasattr(config, "n_embed"):
                 self.hidden_size = config.n_embed
             else:
                 self.hidden_size = config.hidden_size
-            config.num_labels = self.args.num_labels
             model = AutoModelForSequenceClassification.from_pretrained(
-                "bert-base-uncased", 
-                config=config, 
-                device_map=None, 
+                "bert-base-uncased",
+                config=config,
+                device_map=None,
                 torch_dtype=self.dtype,
-                trust_remote_code=True,)
+                trust_remote_code=True,
+            )
             log_rank(' > number of parameters: {:,}'.format(
                 sum([p.nelement() for p in model.parameters()])
             ))
+
+        # If the classifier head is wrong shape, re-initialize for regression
+        if hasattr(model, 'classifier'):
+            out_features = model.classifier.out_features if hasattr(model.classifier, 'out_features') else model.classifier.out_features
+            if out_features != 1:
+                in_features = model.classifier.in_features
+                model.classifier = nn.Linear(in_features, 1).to(model.device)
 
         if self.args.gradient_checkpointing:
             model.gradient_checkpointing_enable()

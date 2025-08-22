@@ -173,16 +173,17 @@ class FKD_A(nn.Module):
         # fuse student
         H_S_fused = torch.einsum("bk,bkh->bh", attn, V)
 
-        # Store attention weights for logging - average across batch
-        # attn shape: [B, K] -> mean to [K]
-        attn_weights_mean = attn.detach().mean(dim=0).cpu().tolist()  # [K]
-        
-        # Store in distiller for access during training loop
-        if not hasattr(distiller, 'current_student_attn_weights'):
-            distiller.current_student_attn_weights = {}
-        # Map to corresponding student layer indices
+        # Store attention weights for logging: attn shape [B, K]
+        # For each batch, store a dict: {student_layer_idx: [attn_w_b1, attn_w_b2, ...]} for all batch samples
+        if not hasattr(distiller, 'epoch_student_attn_weights') or distiller.epoch_student_attn_weights is None:
+            distiller.epoch_student_attn_weights = []
+        # For each student layer, collect all attention weights in this batch
+        attn_np = attn.detach().cpu().to(torch.float32).numpy()  # [B, K]
+        batch_dict = {}
         for i, s_l in enumerate(s_idx):
-            distiller.current_student_attn_weights[s_l] = attn_weights_mean[i]
+            # collect all B attention weights for this student layer
+            batch_dict[int(s_l)] = attn_np[:, i].tolist()
+        distiller.epoch_student_attn_weights.append(batch_dict)
 
         # use teacher fused in student space for matching
         H_T_fused = vec_t_proj

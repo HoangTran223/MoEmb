@@ -122,10 +122,8 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
         max_batches = getattr(args, 'fkd_calib_max_batches', 0)
         it = 0
         iterator = pre_loader
-
         if dist.get_rank() == 0:
             iterator = _tqdm(pre_loader, desc="FKD BI pre-pass", dynamic_ncols=True)
-
         with torch.no_grad():
             for input_batch, output_batch in iterator:
                 dataset['train'].move_to_device([input_batch, output_batch], device)
@@ -158,12 +156,12 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
                 it += 1
                 if max_batches and it >= max_batches:
                     break
-
+        # reduce across ranks
         dist.all_reduce(bi_sums, op=dist.ReduceOp.SUM)
         dist.all_reduce(token_counts, op=dist.ReduceOp.SUM)
         bi_scores = (bi_sums / token_counts.clamp(min=1.0)).to(torch.float32)
         # top-k select
-        k = min(getattr(args, 'fkd_k'), bi_scores.numel())
+        k = min(getattr(args, 'fkd_k', 4), bi_scores.numel())
         sorted_vals, sorted_idx = torch.sort(bi_scores, descending=True)
         top_idx = sorted_idx[:k].tolist()
         # store to distiller
@@ -175,42 +173,48 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
             printable = [(int(i), float(bi_scores[i].item())) for i in sorted_idx.tolist()]
             print("[FKD] BI scores (desc):", printable)
             print(f"[FKD] Selected top-{k} layers:", top_idx)
+            # Persist BI results and mapped student layers to a JSON file for visualization
+            try:
+                # determine number of student layers if possible
+                s_layers = None
+                if hasattr(distiller.student_model, 'config'):
+                    s_layers = getattr(distiller.student_model.config, 'num_hidden_layers', None)
+                # fallback to common attribute
+                if s_layers is None:
+                    try:
+                        s_layers = len(distiller.student_model.base_model.encoder.layer)
+                    except Exception:
+                        s_layers = None
 
-            s_layers = None
-            if hasattr(distiller.student_model, 'config'):
-                s_layers = getattr(distiller.student_model.config, 'num_hidden_layers', None)
-            # fallback to common attribute
-            if s_layers is None:
-                s_layers = len(distiller.student_model.base_model.encoder.layer)
+                mapped_student = []
+                t_layers = bi_scores.numel()
+                for l in top_idx:
+                    ratio = (l + 1) / float(t_layers)
+                    if s_layers is not None:
+                        s_l = max(0, min(s_layers - 1, int(round(ratio * s_layers)) - 1))
+                    else:
+                        s_l = None
+                    mapped_student.append(s_l)
 
-            # Deterministic mapping: s_l = floor(((l+1)*S - 1) / T)
-            mapped_student = []
-            t_layers = int(bi_scores.numel())
-            T = max(1, t_layers)
-            S = int(s_layers) if s_layers is not None else None
-            for l in top_idx:
-                if S is None:
-                    mapped_student.append(None)
-                    continue
-                s_l = int(((int(l) + 1) * S - 1) // T)
-                s_l = max(0, min(S - 1, s_l))
-                mapped_student.append(s_l)
+                save_path = os.path.join(args.save_dir, "fkd_layer_weights.json")
+                # compute softmax weights for selected top-k teacher layers
+                try:
+                    sel_scores = bi_scores[sorted_idx[:k]]
+                    topk_weights = torch.softmax(sel_scores, dim=0).detach().cpu().tolist()
+                except Exception:
+                    topk_weights = [1.0 / max(1, k)] * len(top_idx)
 
-            save_path = os.path.join(args.save_dir, "fkd_layer_weights.json")
-            # compute softmax weights for selected top-k teacher layers
-            sel_scores = bi_scores[sorted_idx[:k]]
-            topk_weights = torch.softmax(sel_scores, dim=0).detach().cpu().tolist()
-
-            out = {
-                "teacher_bi_scores": bi_scores.detach().cpu().tolist(),
-                "teacher_top_k": top_idx,
-                "teacher_top_k_weights": topk_weights,
-                "mapped_student_layers": mapped_student,
-                "per_epoch_student_attention_weights": {}
-            }
-            with open(save_path, 'w') as f:
-                json.dump(out, f, indent=2)
-
+                out = {
+                    "teacher_bi_scores": bi_scores.detach().cpu().tolist(),
+                    "teacher_top_k": top_idx,
+                    "teacher_top_k_weights": topk_weights,
+                    "mapped_student_layers": mapped_student,
+                    "per_epoch_student_means": {}
+                }
+                with open(save_path, 'w') as f:
+                    json.dump(out, f, indent=2)
+            except Exception:
+                pass
         # recreate training sampler with shuffle
         sampler = DistributedSampler(
             dataset["train"], 
@@ -292,7 +296,7 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
                 data_iter.set_postfix(loss=loss.item())
 
 
-        # Log per-epoch attention weights from FKD_A student fusion
+        # Log per-epoch mean of selected student layers' parameters
         if getattr(distiller, 'fkd_info', None) is not None and dist.get_rank() == 0:
             save_path = os.path.join(args.save_dir, "fkd_layer_weights.json")
             try:
@@ -301,20 +305,48 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
             except Exception:
                 data = {}
 
-            # Get attention weights from the criterion forward pass
-            student_attn_weights = getattr(distiller, 'current_student_attn_weights', {})
-            
-            # Store attention weights for this epoch
-            if 'per_epoch_student_attention_weights' not in data:
-                data['per_epoch_student_attention_weights'] = {}
-            
-            # Convert student layer indices to string keys and store their attention weights
-            epoch_attn_weights = {}
-            for s_layer_idx, attn_weight in student_attn_weights.items():
-                epoch_attn_weights[str(s_layer_idx)] = attn_weight
-            
-            data['per_epoch_student_attention_weights'][str(epoch + 1)] = epoch_attn_weights
-            
+            top_idx = data.get('teacher_top_k', [])
+            t_layers = len(data.get('teacher_bi_scores', []))
+            mapped_student = []
+            for l in top_idx:
+                ratio = (l + 1) / float(max(1, t_layers))
+                try:
+                    s_layers = getattr(distiller.student_model.config, 'num_hidden_layers', None)
+                except Exception:
+                    s_layers = None
+                if s_layers is None:
+                    try:
+                        s_layers = len(distiller.student_model.base_model.encoder.layer)
+                    except Exception:
+                        s_layers = None
+                if s_layers is not None:
+                    s_l = max(0, min(s_layers - 1, int(round(ratio * s_layers)) - 1))
+                else:
+                    s_l = None
+                mapped_student.append(s_l)
+
+            epoch_means = {}
+            for idx, s_l in zip(top_idx, mapped_student):
+                if s_l is None:
+                    epoch_means[str(idx)] = None
+                    continue
+                mean_val = None
+                try:
+                    layer = distiller.student_model.base_model.encoder.layer[s_l]
+                    params = []
+                    for name, p in layer.named_parameters():
+                        if p is not None and p.numel() > 0:
+                            params.append(p.detach().float().view(-1))
+                    if len(params) > 0:
+                        allp = torch.cat(params)
+                        mean_val = float(allp.mean().item())
+                except Exception:
+                    mean_val = None
+                epoch_means[str(idx)] = mean_val
+
+            if 'per_epoch_student_means' not in data:
+                data['per_epoch_student_means'] = {}
+            data['per_epoch_student_means'][str(epoch + 1)] = epoch_means
             try:
                 with open(save_path, 'w') as f:
                     json.dump(data, f, indent=2)
