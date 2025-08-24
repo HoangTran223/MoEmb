@@ -152,10 +152,15 @@ def add_hp_args(parser: argparse.ArgumentParser):
     # FKD hyperparameters
     group.add_argument("--fkd-k", type=int, default=4, help="Top-k teacher layers to focus on")
     group.add_argument("--fkd-alpha", type=float, default=1.0, help="Weight for CE loss")
-    group.add_argument("--fkd-beta", type=float, default=1.0, help="Weight for distillation loss (1-cos)")
-    group.add_argument("--fkd-gamma", type=float, default=0.1, help="Weight for contrastive loss")
-    group.add_argument("--fkd-contrastive-temp", type=float, default=0.07, help="Temperature for InfoNCE")
+    group.add_argument("--fkd-beta", type=float, default=1.0, help="Weight for distillation loss (e.g., 1-cos)")
+    group.add_argument("--fkd-gamma", type=float, default=0.1, help="Weight for contrastive loss (used in FKD_A)")
+    group.add_argument("--fkd-contrastive-temp", type=float, default=0.07, help="Temperature for InfoNCE (used in FKD_A)")
     group.add_argument("--fkd-calib-max-batches", type=int, default=0, help="Limit number of batches for BI pre-pass (0 = all)")
+
+    # FKD_DT specific hyperparameters
+    group.add_argument("--pca-mim-sigma", type=float, default=5.0, help="Sigma for positional weight in PCA-MIM")
+    group.add_argument("--pca-mim-tau", type=float, default=0.1, help="Temperature for MI maximization in PCA-MIM")
+    group.add_argument("--pca-mim-iters", type=int, default=5, help="Number of iterations for MI maximization in PCA-MIM")
 
     group.add_argument('--warmup-iters', type=int, default=0,
                        help='percentage of data to warmup on (.01 = 1% of all '

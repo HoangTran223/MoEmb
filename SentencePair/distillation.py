@@ -1,5 +1,6 @@
 import time
 import os
+import numpy as np
 from sklearn.metrics import precision_score, recall_score, precision_recall_fscore_support
 from tqdm import tqdm as _tqdm
 import torch
@@ -100,7 +101,7 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
     # FKD PRE-PASS: compute Block Influence (BI) on calibration set using teacher
     # BI_l = 1 - mean(cos(X_l, Y_l)), where X_l is hidden_states[l] and Y_l is hidden_states[l+1]
 
-    if getattr(args, 'criterion', None) in ['fkd', 'fkd_a']:
+    if getattr(args, 'criterion', None) in ['fkd_a', 'fkd_dt']:
         distiller = model.module  # unwrap Distiller
         if dist.get_rank() == 0:
             print("[FKD] Starting BI pre-pass on calibration set...")
@@ -296,62 +297,47 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
                 data_iter.set_postfix(loss=loss.item())
 
 
-        # Log per-epoch mean of selected student layers' parameters
-        if getattr(distiller, 'fkd_info', None) is not None and dist.get_rank() == 0:
+        # Log per-epoch mean of student attention weights for FKD_A/FKD_DT
+        if getattr(distiller, 'epoch_student_attn_weights', None) and dist.get_rank() == 0:
             save_path = os.path.join(args.save_dir, "fkd_layer_weights.json")
             try:
                 with open(save_path, 'r') as f:
-                    data = json.load(f)
-            except Exception:
-                data = {}
+                    log_data = json.load(f)
+            except (IOError, json.JSONDecodeError):
+                log_data = {}
 
-            top_idx = data.get('teacher_top_k', [])
-            t_layers = len(data.get('teacher_bi_scores', []))
-            mapped_student = []
-            for l in top_idx:
-                ratio = (l + 1) / float(max(1, t_layers))
+            # Aggregate weights from all batches in the epoch
+            epoch_weights = distiller.epoch_student_attn_weights
+            if epoch_weights:
+                aggregated_weights = {}
+                for batch_dict in epoch_weights:
+                    for s_layer, weights in batch_dict.items():
+                        if s_layer not in aggregated_weights:
+                            aggregated_weights[s_layer] = []
+                        # weights can be a list (from FKD_A) or a single float (FKD_DT)
+                        if isinstance(weights, list):
+                            aggregated_weights[s_layer].extend(weights)
+                        else:
+                            aggregated_weights[s_layer].append(weights)
+                
+                # Calculate the mean for each layer
+                mean_layer_weights = {
+                    layer: np.mean(vals) for layer, vals in aggregated_weights.items()
+                }
+
+                if 'per_epoch_student_attn_weights' not in log_data:
+                    log_data['per_epoch_student_attn_weights'] = {}
+                
+                log_data['per_epoch_student_attn_weights'][str(epoch + 1)] = mean_layer_weights
+                
                 try:
-                    s_layers = getattr(distiller.student_model.config, 'num_hidden_layers', None)
-                except Exception:
-                    s_layers = None
-                if s_layers is None:
-                    try:
-                        s_layers = len(distiller.student_model.base_model.encoder.layer)
-                    except Exception:
-                        s_layers = None
-                if s_layers is not None:
-                    s_l = max(0, min(s_layers - 1, int(round(ratio * s_layers)) - 1))
-                else:
-                    s_l = None
-                mapped_student.append(s_l)
-
-            epoch_means = {}
-            for idx, s_l in zip(top_idx, mapped_student):
-                if s_l is None:
-                    epoch_means[str(idx)] = None
-                    continue
-                mean_val = None
-                try:
-                    layer = distiller.student_model.base_model.encoder.layer[s_l]
-                    params = []
-                    for name, p in layer.named_parameters():
-                        if p is not None and p.numel() > 0:
-                            params.append(p.detach().float().view(-1))
-                    if len(params) > 0:
-                        allp = torch.cat(params)
-                        mean_val = float(allp.mean().item())
-                except Exception:
-                    mean_val = None
-                epoch_means[str(idx)] = mean_val
-
-            if 'per_epoch_student_means' not in data:
-                data['per_epoch_student_means'] = {}
-            data['per_epoch_student_means'][str(epoch + 1)] = epoch_means
-            try:
-                with open(save_path, 'w') as f:
-                    json.dump(data, f, indent=2)
-            except Exception:
-                pass
+                    with open(save_path, 'w') as f:
+                        json.dump(log_data, f, indent=2)
+                except IOError as e:
+                    log_rank(f"Error writing to fkd_layer_weights.json: {e}")
+            
+            # Reset for the next epoch
+            distiller.epoch_student_attn_weights = []
 
         if args.save_dir and (epoch + 1) % args.save_interval == 0: #save_interval = 1 then save each epoch
             #eval_interval = 1 then evaluate each epoch

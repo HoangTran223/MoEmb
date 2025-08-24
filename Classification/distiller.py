@@ -15,7 +15,7 @@ from peft import (
     TaskType,
     get_peft_model
 )
-from Classification.utils import log_rank
+from Classfication.utils import log_rank
 from huggingface_hub import login
 
 hf_token = os.getenv("HF_TOKEN", None)
@@ -42,8 +42,8 @@ class Distiller(nn.Module):
         if self.teacher_model and self.args.projector_config_path:
             self.set_and_load_existing_projectors()
             log_rank(f"projector structure: {self.projectors}")
-        # Pre-create W_q for FKD_A so optimizer captures its params
-        if getattr(self.args, 'criterion', None) in ['fkd_a'] and self.teacher_model is not None:
+        # Pre-create W_q for FKD_A/FKD_DT so optimizer captures its params (if t2s not provided)
+        if getattr(self.args, 'criterion', None) in ['fkd_a', 'fkd_dt'] and self.teacher_model is not None:
             in_dim = getattr(self, 'teacher_hidden_size', None) or getattr(self, 'hidden_size', None)
             out_dim = getattr(self, 'hidden_size', None) or in_dim
             if 'W_q' not in self.projectors and in_dim is not None and out_dim is not None:
