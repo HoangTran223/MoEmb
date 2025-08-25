@@ -162,6 +162,21 @@ def add_hp_args(parser: argparse.ArgumentParser):
     group.add_argument("--pca-mim-tau", type=float, default=0.1, help="Temperature for MI maximization in PCA-MIM")
     group.add_argument("--pca-mim-iters", type=int, default=5, help="Number of iterations for MI maximization in PCA-MIM")
 
+    # FKD_FINAL specific hyperparameters
+    group.add_argument("--fkd-final-lambda", type=float, default=0.7, help="Weight for contextual score in hybrid alignment")
+    group.add_argument("--fasttext-min-count", type=int, default=1, help="Minimum count for FastText training")
+    group.add_argument("--fasttext-dim", type=int, default=100, help="Dimension of FastText embeddings")
+    group.add_argument("--fasttext-epoch", type=int, default=5, help="Number of epochs for FastText training")
+    group.add_argument("--fasttext-minn", type=int, default=3, help="Minimum character n-gram size for FastText")
+    group.add_argument("--fasttext-maxn", type=int, default=6, help="Maximum character n-gram size for FastText")
+    group.add_argument("--ot-reg", type=float, default=0.1, help="Regularization parameter for optimal transport")
+    group.add_argument("--ot-numitermax", type=int, default=1000, help="Maximum number of iterations for OT solver")
+    group.add_argument("--global-alignment-path", type=str, default="global_alignment.npy", help="Path to save/load global alignment matrix")
+    group.add_argument("--teacher-fasttext-path", type=str, default=None, help="Path to pre-trained teacher FastText model")
+    group.add_argument("--student-fasttext-path", type=str, default=None, help="Path to pre-trained student FastText model")
+    group.add_argument("--fkd-final-alpha", type=float, default=1.0, help="Weight for CE loss in FKD_FINAL")
+    group.add_argument("--fkd-final-beta", type=float, default=1.0, help="Weight for distillation loss in FKD_FINAL")
+
     group.add_argument('--warmup-iters', type=int, default=0,
                        help='percentage of data to warmup on (.01 = 1% of all '
                        'training iters). Default 0.01')

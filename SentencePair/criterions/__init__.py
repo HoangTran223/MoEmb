@@ -17,6 +17,7 @@ from .ot_pro_rmse_cka import OT_PRO_RMSE_CKA
 from .multi_level_ot import MULTI_LEVEL_OT
 from .FKD_A import FKD_A
 from .FKD_DT import FKD_DT
+from .FKD_FINAL import FKD_FINAL
 
 criterion_list = {
     "cross_entropy": CrossEntropyLoss,
@@ -39,6 +40,7 @@ criterion_list = {
     "multi_level_ot": MULTI_LEVEL_OT,
     "fkd_a": FKD_A,
     "fkd_dt": FKD_DT,
+    "fkd_final": FKD_FINAL,
 }
 
 def build_criterion(args):

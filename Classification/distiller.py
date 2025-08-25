@@ -15,7 +15,7 @@ from peft import (
     TaskType,
     get_peft_model
 )
-from Classfication.utils import log_rank
+from Classification.utils import log_rank
 from huggingface_hub import login
 
 hf_token = os.getenv("HF_TOKEN", None)
