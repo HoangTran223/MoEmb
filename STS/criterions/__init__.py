@@ -5,7 +5,7 @@ from .ot_pro import OT_PRO
 from .ot_pro_rmse_cka import OT_PRO_RMSE_CKA
 from .FKD import FKD
 from .FKD_A import FKD_A
-from .FKD_FINAL import FKD_FINAL
+from .FKD_H import FKD_H
 
 criterion_list = {
     "sts_loss": STSLoss,
@@ -15,7 +15,7 @@ criterion_list = {
     "ot_pro_rmse_cka": OT_PRO_RMSE_CKA,
     "fkd": FKD,
     "fkd_a": FKD_A,
-    "fkd_final": FKD_FINAL
+    "fkd_h": FKD_H
 }
 
 def build_criterion(args):

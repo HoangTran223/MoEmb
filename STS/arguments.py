@@ -157,6 +157,14 @@ def add_hp_args(parser: argparse.ArgumentParser):
     group.add_argument("--fkd-contrastive-temp", type=float, default=0.07, help="Temperature for InfoNCE")
     group.add_argument("--fkd-calib-max-batches", type=int, default=0, help="Limit number of batches for BI pre-pass (0 = all)")
 
+    # FKD_H specific hyperparameters
+    group.add_argument("--fkd-h-alpha", type=float, default=0.2, help="Weight for CE loss in FKD_H")
+    group.add_argument("--fkd-h-beta", type=float, default=1.0, help="Weight for distillation loss in FKD_H")
+    group.add_argument("--fkd-h-lambda", type=float, default=0.3, help="Global-vs-contextual mix (lambda) in FKD_H")
+    group.add_argument("--fkd-h-align-topk", type=int, default=32, help="Top-k teacher tokens per student token in FKD_H")
+    group.add_argument("--global-alignment-path", type=str, default=None, help="Path to global alignment matrix .npy")
+    group.add_argument("--offline-projection-path", type=str, default=None, help="Path to offline projection W_q .pt")
+
     group.add_argument('--warmup-iters', type=int, default=0,
                        help='percentage of data to warmup on (.01 = 1% of all '
                        'training iters). Default 0.01')
