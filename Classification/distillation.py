@@ -305,6 +305,13 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
                 print("⚠️ Loss is NaN or Inf. Skipping this step.")
                 continue
 
+            # Add losses to logging lists
+            logging_output.get('loss', None)
+            if "ce_loss" in logging_output:
+                logging_output.get('ce_loss', None)
+            if "distill_loss" in logging_output:
+                logging_output.get('distill_loss', None)
+
             
             model.backward(loss)
             model.step()
@@ -321,7 +328,17 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
             logging_output["step_time"].append(elapsed_time)
 
             if dist.get_rank() == 0:
-                data_iter.set_postfix(loss=loss.item())
+                ce = logging_output.get("ce_loss", None)
+                kd = logging_output.get("distill_loss", None)
+                if ce is not None and kd is not None:
+                    data_iter.set_postfix(loss=loss.item(), ce=round(float(ce), 4), kd=round(float(kd), 4))
+                    # Also print detailed loss breakdown every 10 steps
+                    if step % 10 == 0:
+                        print(f"[Step {step}] Total: {loss.item():.4f}, CE: {float(ce):.4f}, KD: {float(kd):.4f}")
+                else:
+                    data_iter.set_postfix(loss=loss.item())
+                    if step % 10 == 0:
+                        print(f"[Step {step}] Total: {loss.item():.4f} (no component breakdown available)")
 
 
     # Log per-epoch mean of student attention weights for FKD_A/FKD_H
@@ -519,6 +536,15 @@ def main():
     log_rank("Initializing a distiller for knowledge distillation...")
     distiller = Distiller(args, device)
     dataset = prepare_dataset(args, distiller)
+    # Always use full vocabulary sizes; log them for clarity
+    if dist.get_rank() == 0:
+        try:
+            s_vs = getattr(distiller, 'student_vocab_size', None)
+            t_vs = getattr(distiller, 'teacher_vocab_size', None)
+            log_rank(f"[Vocab] Student vocab size: {s_vs}")
+            log_rank(f"[Vocab] Teacher vocab size: {t_vs}")
+        except Exception:
+            pass
     
     if args.do_train:
         args.train_iters_per_epoch = int(len(dataset["train"]) / (args.batch_size * dp_world_size))

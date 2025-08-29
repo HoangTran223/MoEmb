@@ -150,9 +150,15 @@ def main():
     E_To = E_T[idx_T]
     E_So = E_S[idx_S]
 
-    # Whiten both sides
+    # Whiten both sides (use overlap rows on both sides)
     E_To_w, mu_T, invsqrt_T = _whiten(E_To)
-    E_So_w, mu_S, invsqrt_S = _whiten(E_S)
+    E_So_w, mu_S, invsqrt_S = _whiten(E_So)
+
+    # Sanity check shapes match on n (overlap count)
+    if E_To_w.shape[0] != E_So_w.shape[0]:
+        raise RuntimeError(
+            f"[FKD_H][Offline] Overlap row mismatch: teacher {E_To_w.shape} vs student {E_So_w.shape}"
+        )
 
     # Learn ridge W (H_S x H_T)
     print("[FKD_H][Offline] Solving for W (ridge)...")
@@ -183,7 +189,7 @@ def main():
     cost = (1.0 - cos_TS).astype(np.float32)
     a = np.ones(cost.shape[0], dtype=np.float64) / float(cost.shape[0])
     b = np.ones(cost.shape[1], dtype=np.float64) / float(cost.shape[1])
-    P = ot.sinkhorn(a, b, cost, reg=0.1, numItermax=1000)
+    P = ot.sinkhorn(a, b, cost, reg=0.1, numItermax=2000)
 
     out_dir = os.path.dirname(args.output_path)
     if out_dir:

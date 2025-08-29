@@ -173,12 +173,12 @@ def add_hp_args(parser: argparse.ArgumentParser):
     group.add_argument("--student-fasttext-path", type=str, default=None, help="Path to pre-trained student FastText model")
     group.add_argument("--fkd-final-alpha", type=float, default=1.0, help="Weight for CE loss in FKD_FINAL")
     group.add_argument("--fkd-final-beta", type=float, default=1.0, help="Weight for distillation loss in FKD_FINAL")
+    group.add_argument("--offline-projection-path", type=str, default=None, help="Path to offline W_q projection matrix")
     # FKD_H naming (aliases fall back to *_final above when unset)
     group.add_argument("--fkd-h-alpha", type=float, default=None, help="Weight for CE loss in FKD_H")
     group.add_argument("--fkd-h-beta", type=float, default=None, help="Weight for distillation loss in FKD_H")
     group.add_argument("--fkd-h-lambda", type=float, default=None, help="Hybrid lambda for global scores in FKD_H")
     group.add_argument("--fkd-h-align-topk", type=int, default=32, help="Top-k teacher tokens per student token in FKD_H")
-    group.add_argument("--offline-projection-path", type=str, default=None, help="Optional path to a teacher->student projection state_dict for initializing W_q in FKD_H")
 
     group.add_argument('--warmup-iters', type=int, default=0,
                        help='percentage of data to warmup on (.01 = 1% of all '

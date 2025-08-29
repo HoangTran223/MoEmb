@@ -34,11 +34,33 @@ class Distiller(nn.Module):
         # ensure a container for optional projectors exists early
         self.projectors = nn.ModuleDict()
         self.student_model, self.student_tokenizer = self.load_student_model()
+        # record student vocab size explicitly (always use full vocab size)
+        try:
+            self.student_vocab_size = getattr(self.student_tokenizer, 'vocab_size', None)
+            if self.student_vocab_size is None and self.student_tokenizer is not None:
+                self.student_vocab_size = len(self.student_tokenizer)
+        except Exception:
+            self.student_vocab_size = None
+        if self.student_vocab_size is not None:
+            log_rank(f"[Distiller] Student vocab size: {self.student_vocab_size}")
         
         if self.args.teacher_model_path is not None:
             self.teacher_model, self.teacher_tokenizers = self.load_teacher_model()
         else:
             self.teacher_model, self.teacher_tokenizers = None, {}
+        # record teacher vocab size explicitly (always use full vocab size)
+        try:
+            if self.teacher_tokenizers is not None and self.teacher_tokenizers != {}:
+                tokenizer_obj = self.teacher_tokenizers
+                self.teacher_vocab_size = getattr(tokenizer_obj, 'vocab_size', None)
+                if self.teacher_vocab_size is None:
+                    self.teacher_vocab_size = len(tokenizer_obj)
+            else:
+                self.teacher_vocab_size = None
+        except Exception:
+            self.teacher_vocab_size = None
+        if self.teacher_vocab_size is not None:
+            log_rank(f"[Distiller] Teacher vocab size: {self.teacher_vocab_size}")
         if self.teacher_model and self.args.projector_config_path:
             self.set_and_load_existing_projectors()
             log_rank(f"projector structure: {self.projectors}")
