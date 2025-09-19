@@ -69,6 +69,74 @@ class DistillDataset(Dataset):
                         truncation=True
                     )
                     tokenized_data["teacher_input_ids"] = teacher_input_ids
+
+                    # Precompute span-overlap pairs once to avoid runtime tokenization cost
+                    try:
+                        t_enc = self.teacher_tokenizer(
+                            row['text'],
+                            return_offsets_mapping=True,
+                            truncation=True,
+                            max_length=self.max_length,
+                            add_special_tokens=True,
+                            return_tensors=None,
+                        )
+                        s_enc = self.student_tokenizer(
+                            row['text'],
+                            return_offsets_mapping=True,
+                            truncation=True,
+                            max_length=self.max_length,
+                            add_special_tokens=True,
+                            return_tensors=None,
+                        )
+                        # Normalize shapes (single string vs batched)
+                        def _flat_ids(v):
+                            if isinstance(v, list) and v and isinstance(v[0], (list, tuple, np.ndarray)):
+                                return v[0]
+                            return v
+                        def _flat_off(v):
+                            if isinstance(v, list) and v and isinstance(v[0], (list, tuple)) and len(v[0]) > 0 and isinstance(v[0][0], (list, tuple)):
+                                return v[0]
+                            return v
+                        t_ids_tok = _flat_ids(t_enc["input_ids"])
+                        s_ids_tok = _flat_ids(s_enc["input_ids"])
+                        t_off = _flat_off(t_enc["offset_mapping"])
+                        s_off = _flat_off(s_enc["offset_mapping"])
+
+                        # Compute valid positions (exclude specials/pad)
+                        t_pad = getattr(self.teacher_tokenizer, 'pad_token_id', None)
+                        s_pad = getattr(self.student_tokenizer, 'pad_token_id', None)
+                        t_spec = set(getattr(self.teacher_tokenizer, 'all_special_ids', []) or [])
+                        s_spec = set(getattr(self.student_tokenizer, 'all_special_ids', []) or [])
+                        def _valid(ids, offs, pad, specs):
+                            pos = []
+                            for i, (tid, (a, b)) in enumerate(zip(ids, offs)):
+                                if (pad is not None and tid == pad) or (tid in specs):
+                                    continue
+                                if a == 0 and b == 0 and ((pad is not None and tid == pad) or tid in specs):
+                                    continue
+                                if b <= a:
+                                    continue
+                                pos.append(i)
+                            return pos
+                        t_valid = _valid(t_ids_tok, t_off, t_pad, t_spec)
+                        s_valid = _valid(s_ids_tok, s_off, s_pad, s_spec)
+
+                        pairs = []
+                        for sj in s_valid:
+                            sa, sb = s_off[sj]
+                            if sb <= sa:
+                                continue
+                            for ti in t_valid:
+                                ta, tb = t_off[ti]
+                                if tb <= ta:
+                                    continue
+                                if (sa < tb) and (ta < sb):
+                                    pairs.append((ti, sj))
+                        # Store pairs; empty list is acceptable (we'll fallback to runtime recompute if needed)
+                        tokenized_data["overlap_pairs"] = pairs
+                    except Exception:
+                        # Skip precomp on any tokenizer issue; FKD_H will recompute at runtime
+                        pass
                 dataset.append(tokenized_data)
             return dataset
         else:
@@ -122,10 +190,16 @@ class DistillDataset(Dataset):
                 "teacher_attention_mask": torch.zeros(bs, max_length),
             })
 
-        # Also collect the original text fields for each sample, if present
+        # Also collect the original text fields for each sample (required)
         texts = [samp["text"] if "text" in samp else None for samp in samples]
+        overlaps_list = []
         for i, samp in enumerate(samples):
             self._process_classification(i, samp, model_data, output_data)
-        # Add the text field to model_data for KD loss logic
+            # collect precomputed overlaps if any
+            overlaps_list.append(samp.get("overlap_pairs", None))
+        # Add explicit text fields for FKD_H span-overlap logic (teacher/student can be the same source text)
         model_data["text"] = texts
+        model_data["teacher_texts"] = texts
+        model_data["student_texts"] = texts
+        model_data["overlaps"] = overlaps_list
         return model_data, output_data

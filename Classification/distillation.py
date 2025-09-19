@@ -278,13 +278,7 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
         
         log_rank("Start iterations of epoch {}".format(epoch + 1))
         model.train()
-        try:
-            print("Training mode?", model.module.student_model.training)
-        except Exception:
-            try:
-                print("Training mode?", model.student_model.training)
-            except Exception:
-                pass
+        print("Training mode?", model.student_model.training)  # True
 
         epoch_start_time = time.time()
         step = 0
@@ -405,28 +399,29 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
                 if not args.only_save_projector:
                     log_rank("Saving tokenizer...")
                     tokenizer.save_pretrained(save_dir_path)
-                    log_rank("Saving model (backbone)...")
-                    try:
-                        # If wrapped, save underlying base model
-                        model.module.student_model.base_model.save_pretrained(save_dir_path, safe_serialization=False)
-                    except Exception:
-                        # Fallback for true PreTrainedModel
-                        model.module.student_model.save_pretrained(save_dir_path, safe_serialization=False)
-                    classifier_path = os.path.join(save_dir_path, "classifier_head.bin")
-                    if hasattr(model.module.student_model, 'score'):  # some models name head 'score'
-                        log_rank("Saving Mistral classifier head (score)...")
-                        torch.save(model.module.student_model.score.state_dict(), classifier_path)
-                    elif hasattr(model.module.student_model, 'classifier'):  # BERT model
-                        log_rank("Saving BERT classifier head (classifier)...")
-                        torch.save(model.module.student_model.classifier.state_dict(), classifier_path)
+                    log_rank("Saving model (backbone + head)...")
+                    sm = model.module.student_model
+                    # Save backbone
+                    if hasattr(sm, 'base') and hasattr(sm.base, 'save_pretrained'):
+                        sm.base.save_pretrained(save_dir_path, safe_serialization=False)
+                        # Save head
+                        classifier_path = os.path.join(save_dir_path, "classifier_head.bin")
+                        if hasattr(sm, 'classifier'):
+                            torch.save(sm.classifier.state_dict(), classifier_path)
+                            log_rank("Saved classifier head state_dict.")
+                        else:
+                            log_rank("Warning: No classifier head found on wrapper; skipping.")
+                        # Save config
+                        try:
+                            sm.base.config.save_pretrained(save_dir_path)
+                        except Exception:
+                            pass
                     else:
-                        log_rank("Warning: Could not identify classifier head structure, no classifier saved.")
-                    log_rank("Saving config")
-                    # save config from wrapper or base model
-                    try:
-                        model.module.student_model.config.save_pretrained(save_dir_path)
-                    except Exception:
-                        model.module.student_model.base_model.config.save_pretrained(save_dir_path)
+                        # Fallback: try to save whole module if it's a PreTrainedModel
+                        try:
+                            sm.save_pretrained(save_dir_path, safe_serialization=False)
+                        except Exception as e:
+                            log_rank(f"Warning: Failed to save full model via save_pretrained: {e}")
                 if hasattr(model.module, "projectors"):
                     log_rank("Saving projector...")
                     torch.save(
@@ -478,10 +473,13 @@ def evaluate(args, tokenizer, student_model, dataset, split, device):
 
         dataset.move_to_device([input_batch, output_batch], device)
         labels = output_batch["labels"]       
+        # Với AutoModel + wrapper, không truyền position_ids (OPT-safe) và labels để có loss CE
         outputs = student_model(
             input_ids=input_batch["input_ids"],
-            attention_mask=input_batch.get("attention_mask", None),
-            labels=labels
+            attention_mask=input_batch["attention_mask"],
+            labels=labels,
+            output_hidden_states=False,
+            return_dict=True,
         )
         logits = outputs.logits
         loss = outputs.loss

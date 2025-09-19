@@ -159,8 +159,12 @@ def add_hp_args(parser: argparse.ArgumentParser):
 
     # FKD_DT removed
 
+
     # FKD_FINAL / FKD_H specific hyperparameters
     group.add_argument("--fkd-final-lambda", type=float, default=0.7, help="Weight for contextual score in hybrid alignment")
+    group.add_argument("--fkd-use-span-overlap", dest="fkd_use_span_overlap", action="store_true", help="Use span-based overlap via offset_mapping to build O_j")
+    group.add_argument("--no-fkd-use-span-overlap", dest="fkd_use_span_overlap", action="store_false", help="Disable span-based overlap; fall back to token-id or diagonal")
+    group.set_defaults(fkd_use_span_overlap=True)
     group.add_argument("--fasttext-min-count", type=int, default=1, help="Minimum count for FastText training")
     group.add_argument("--fasttext-dim", type=int, default=100, help="Dimension of FastText embeddings")
     group.add_argument("--fasttext-epoch", type=int, default=5, help="Number of epochs for FastText training")

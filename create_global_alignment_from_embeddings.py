@@ -23,6 +23,7 @@ import argparse
 import math
 import numpy as np
 from typing import Dict, Tuple, List
+from tqdm import tqdm
 
 import torch
 from transformers import AutoModel, AutoTokenizer
@@ -67,46 +68,163 @@ def _load_embeddings(model_name: str, adapter_path: str = None, torch_dtype: tor
 
 
 def _whiten(X: np.ndarray, eps: float = 1e-6) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Whiten rows of X (n x d). Returns (X_hat, mean, inv_sqrt_cov)."""
-    Xc = X - X.mean(axis=0, keepdims=True)
-    cov = (Xc.T @ Xc) / max(1, Xc.shape[0] - 1)
-    # Eigendecomposition
-    s, U = np.linalg.eigh(cov)
-    s_clamped = np.clip(s, a_min=eps, a_max=None)
-    inv_sqrt = (U @ np.diag(1.0 / np.sqrt(s_clamped)) @ U.T).astype(np.float32)
-    X_hat = (Xc @ inv_sqrt).astype(np.float32)
-    return X_hat, X.mean(axis=0, keepdims=True).astype(np.float32), inv_sqrt
+    """Whiten rows of X (n x d) with GPU acceleration when available.
+
+    Returns (X_hat, mean, inv_sqrt_cov) in float32 for numerical stability.
+    """
+    try:
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        Xt = torch.as_tensor(X, dtype=torch.float32, device=device)
+        mean = Xt.mean(dim=0, keepdim=True)
+        Xc = Xt - mean
+        n = max(1, Xc.shape[0] - 1)
+        cov = (Xc.transpose(0, 1) @ Xc) / float(n)
+        evals, evecs = torch.linalg.eigh(cov)
+        evals = torch.clamp(evals, min=eps)
+        inv_sqrt = evecs @ torch.diag(1.0 / torch.sqrt(evals)) @ evecs.transpose(0, 1)
+        X_hat = Xc @ inv_sqrt
+        return (
+            X_hat.detach().cpu().numpy().astype(np.float32, copy=False),
+            mean.detach().cpu().numpy().astype(np.float32, copy=False),
+            inv_sqrt.detach().cpu().numpy().astype(np.float32, copy=False),
+        )
+    except Exception:
+        Xc = X - X.mean(axis=0, keepdims=True)
+        cov = (Xc.T @ Xc) / max(1, Xc.shape[0] - 1)
+        s, U = np.linalg.eigh(cov)
+        s_clamped = np.clip(s, a_min=eps, a_max=None)
+        inv_sqrt = (U @ np.diag(1.0 / np.sqrt(s_clamped)) @ U.T).astype(np.float32)
+        X_hat = (Xc @ inv_sqrt).astype(np.float32)
+        return X_hat, X.mean(axis=0, keepdims=True).astype(np.float32), inv_sqrt
 
 
 def _ridge_t2s(X_t: np.ndarray, Y_s: np.ndarray, lam: float = 1e-3) -> np.ndarray:
     """Solve ridge regression Y_s ~= X_t @ W^T for W in R^{H_S x H_T}.
-    Closed form: W^T = (X^T X + lam I)^{-1} X^T Y
+    Uses GPU when available; returns float32 W (H_S x H_T).
     """
-    # shapes: X (n, H_T), Y (n, H_S)
-    XtX = X_t.T @ X_t  # (H_T, H_T)
-    H_T = XtX.shape[0]
-    reg = lam * np.eye(H_T, dtype=np.float32)
-    A = XtX + reg
-    XtY = X_t.T @ Y_s  # (H_T, H_S)
-    # Solve A @ W_T = XtY for W_T
-    W_T = np.linalg.solve(A, XtY)  # (H_T, H_S)
-    W = W_T.T.astype(np.float32)   # (H_S, H_T)
-    return W
+    try:
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        Xt = torch.as_tensor(X_t, dtype=torch.float32, device=device)
+        Ys = torch.as_tensor(Y_s, dtype=torch.float32, device=device)
+        XtX = Xt.transpose(0, 1) @ Xt  # [d_t, d_t]
+        d_t = XtX.shape[0]
+        A = XtX + lam * torch.eye(d_t, dtype=torch.float32, device=device)
+        XtY = Xt.transpose(0, 1) @ Ys  # [d_t, d_s]
+        W_T = torch.linalg.solve(A, XtY)
+        W = W_T.transpose(0, 1).detach().cpu().numpy().astype(np.float32, copy=False)
+        return W
+    except Exception:
+        XtX = X_t.T @ X_t
+        H_T = XtX.shape[0]
+        reg = lam * np.eye(H_T, dtype=np.float32)
+        A = XtX.astype(np.float32) + reg
+        XtY = (X_t.T @ Y_s).astype(np.float32)
+        W_T = np.linalg.solve(A, XtY)
+        W = W_T.T.astype(np.float32)
+        return W
 
 
-def _cosine_matrix(A: np.ndarray, B: np.ndarray, eps: float = 1e-8, batch: int = 4096) -> np.ndarray:
-    """Compute cosine similarity between rows of A (n x d) and B (m x d) with batching.
-    Returns (n x m) float32.
+def _cosine_matrix(A: np.ndarray, B: np.ndarray, batch: int = 4096) -> np.ndarray:
+    """Compute cosine similarity matrix with batching.
+
+    Optimized: use PyTorch on GPU (float32 compute) when available, fallback to NumPy.
+    Returns float16 matrix for compactness; caller can cast.
     """
-    A_norm = A / (np.linalg.norm(A, axis=1, keepdims=True) + eps)
-    B_norm = B / (np.linalg.norm(B, axis=1, keepdims=True) + eps)
     n, m = A.shape[0], B.shape[0]
-    out = np.empty((n, m), dtype=np.float32)
-    bs = max(1, batch)
-    for i in range(0, n, bs):
-        j = min(n, i + bs)
-        out[i:j] = A_norm[i:j] @ B_norm.T
-    return out
+    try:
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        with torch.no_grad():
+            At = torch.as_tensor(A, dtype=torch.float32, device=device)
+            Bt = torch.as_tensor(B, dtype=torch.float32, device=device)
+            An = At / (At.norm(dim=1, keepdim=True) + 1e-8)
+            Bn = Bt / (Bt.norm(dim=1, keepdim=True) + 1e-8)
+
+            result = np.zeros((n, m), dtype=np.float16)
+            row_bs = max(1, batch)
+            col_bs = 8192 if m >= 8192 else m
+            total_blocks = ((n - 1) // row_bs + 1) * ((m - 1) // col_bs + 1)
+            pbar = tqdm(total=total_blocks, desc="Computing cosine similarity (GPU)", unit="blk")
+            for i in range(0, n, row_bs):
+                ie = min(i + row_bs, n)
+                block = An[i:ie]
+                for j in range(0, m, col_bs):
+                    je = min(j + col_bs, m)
+                    sim_block = block @ Bn[j:je].transpose(0, 1)
+                    result[i:ie, j:je] = sim_block.to('cpu', dtype=torch.float16).numpy()
+                    pbar.update(1)
+            pbar.close()
+            return result
+    except Exception:
+        pass
+
+    # CPU fallback (NumPy)
+    A_norm = A / (np.linalg.norm(A, axis=1, keepdims=True) + 1e-8)
+    B_norm = B / (np.linalg.norm(B, axis=1, keepdims=True) + 1e-8)
+    result = np.zeros((n, m), dtype=np.float16)
+    pbar = tqdm(range(0, n, batch), desc="Computing cosine similarity (CPU)", unit="blk")
+    for i in pbar:
+        ie = min(i + batch, n)
+        result[i:ie] = (A_norm[i:ie] @ B_norm.T).astype(np.float16)
+    pbar.close()
+    return result
+
+def _project_embeddings(teacher_emb: np.ndarray, W: np.ndarray, row_bs: int = 8192) -> np.ndarray:
+    """Project teacher embeddings using W.T with GPU acceleration when available.
+
+    Computes: teacher_proj = teacher_emb @ W.T
+    - teacher_emb: [V_T, d_t] float16/float32 numpy
+    - W: [d_s, d_t] float16/float32 numpy (will upcast to float32 for compute)
+    Returns: [V_T, d_s] float16 numpy
+    """
+    V_T, d_t = teacher_emb.shape
+    d_s, d_t_w = W.shape
+    assert d_t == d_t_w, "Dimension mismatch between teacher_emb and W"
+
+    result = np.empty((V_T, d_s), dtype=np.float16)
+    try:
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        W_tT = torch.as_tensor(W, dtype=torch.float32, device=device).transpose(0, 1)
+        with torch.no_grad():
+            for i in tqdm(range(0, V_T, row_bs), desc="Projecting teacher embeddings", unit="blk"):
+                ie = min(i + row_bs, V_T)
+                block = torch.as_tensor(teacher_emb[i:ie], dtype=torch.float32, device=device)
+                out = block @ W_tT
+                result[i:ie] = out.to('cpu', dtype=torch.float16).numpy()
+        return result
+    except Exception:
+        W_tT_np = W.astype(np.float32).T
+        for i in tqdm(range(0, V_T, row_bs), desc="Projecting teacher embeddings (CPU)", unit="blk"):
+            ie = min(i + row_bs, V_T)
+            out = teacher_emb[i:ie].astype(np.float32) @ W_tT_np
+            result[i:ie] = out.astype(np.float16)
+        return result
+
+def _sinkhorn(C: np.ndarray, reg: float = 0.1, max_iter: int = 1000, tol: float = 1e-7) -> np.ndarray:
+    """Sinkhorn algorithm for optimal transport with POT when available, else numpy fallback."""
+    n, m = C.shape
+    C = np.nan_to_num(C, nan=1.0, posinf=2.0, neginf=0.0).astype(np.float32, copy=False)
+    a = np.ones(n, dtype=np.float32) / float(n)
+    b = np.ones(m, dtype=np.float32) / float(m)
+    if 'ot' in globals() and ot is not None:
+        try:
+            P = ot.bregman.sinkhorn(a, b, C, reg, numItermax=max_iter, stopThr=tol, verbose=False)
+            return P.astype(np.float16)
+        except Exception:
+            pass
+    # Numpy fallback
+    K = np.exp(-C / reg).astype(np.float32)
+    u = np.ones(n, dtype=np.float32) / float(n)
+    b_f = np.ones(m, dtype=np.float32) / float(m)
+    for _ in range(max_iter):
+        denom = (K.T @ u) + 1e-12
+        v = b_f / denom
+        u = 1.0 / (K @ v + 1e-12)
+        u = np.clip(u, 1e-20, 1e20)
+        v = np.clip(v, 1e-20, 1e20)
+        # optional early stop omitted for simplicity
+    v = b_f / (K.T @ u + 1e-12)
+    P = np.diag(u) @ K @ np.diag(v)
+    return P.astype(np.float16)
 
 
 def main():
@@ -115,11 +233,19 @@ def main():
     ap.add_argument("--student-model", required=True)
     ap.add_argument("--teacher-adapter-path", default=None, help="Optional path to teacher adapter (LoRA) to merge")
     ap.add_argument("--student-adapter-path", default=None, help="Optional path to student adapter (LoRA) to merge")
-    ap.add_argument("--output-path", required=True, help="Path to save global alignment .npy (shape |V_T| x |V_S|)")
+    ap.add_argument("--output-path", required=True, help="Path to save global alignment (.npy or .npz)")
     ap.add_argument("--save-projection-path", required=True, help="Path to save W_q state_dict .pt")
     ap.add_argument("--ridge-lambda", type=float, default=1e-3)
     ap.add_argument("--teacher-vocab-max", type=int, default=None, help="Optional cap on teacher vocab size")
     ap.add_argument("--student-vocab-max", type=int, default=None, help="Optional cap on student vocab size")
+    # Parity with DSKD: sinkhorn reg and compressed save formats
+    ap.add_argument("--sinkhorn-reg", type=float, default=0.1, help="Sinkhorn regularization parameter")
+    ap.add_argument("--save-format", type=str, default="npy", choices=["npy", "fp16", "uint8", "topk"],
+                    help="How to store the alignment matrix: raw npy (float32), fp16 npy, quantized uint8 .npz, or top-k sparse .npz")
+    ap.add_argument("--topk", type=int, default=64,
+                    help="Top-K per row for 'topk' save-format. Set 0 or negative to use all columns (maximum K).")
+    ap.add_argument("--quantize-bits", type=int, default=8,
+                    help="Bits for quantization when save-format is 'uint8' (currently only 8 supported)")
     args = ap.parse_args()
 
     print("[FKD_H][Offline] Loading embeddings...")
@@ -180,22 +306,73 @@ def main():
     }, args.save_projection_path)
     print(f"[FKD_H][Offline] Saved W to {args.save_projection_path} with shape {W.shape}")
 
-    # Compute projected teacher embeddings for all vocabulary tokens
-    E_T_proj = E_T @ W.T  # (|V_T|, H_S)
+    # Compute projected teacher embeddings for all vocabulary tokens (batched, GPU-accelerated when available)
+    E_T_proj = _project_embeddings(E_T, W)
 
     # Build cosine similarity matrix and OT plan
     print("[FKD_H][Offline] Building cosine matrix and solving OT...")
     cos_TS = _cosine_matrix(E_T_proj.astype(np.float32), E_S.astype(np.float32))  # (|V_T|, |V_S|)
     cost = (1.0 - cos_TS).astype(np.float32)
-    a = np.ones(cost.shape[0], dtype=np.float32) / float(cost.shape[0])
-    b = np.ones(cost.shape[1], dtype=np.float32) / float(cost.shape[1])
-    P = ot.sinkhorn(a, b, cost, reg=0.1, numItermax=1000)
-
+    reg = float(getattr(args, "sinkhorn_reg", 0.1))
+    P = _sinkhorn(cost, reg)
+    # Save in requested format (parity with DSKD)
+    n_rows, n_cols = P.shape
     out_dir = os.path.dirname(args.output_path)
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
-    np.save(args.output_path, P.astype(np.float32))
-    print(f"[FKD_H][Offline] Saved global alignment to {args.output_path} with shape {P.shape}")
+    save_fmt = getattr(args, "save_format", "npy")
+    if save_fmt == "npy":
+        out_path = args.output_path if args.output_path.endswith('.npy') else args.output_path + '.npy'
+        print(f"[FKD_H][Offline] Saving float32 npy to {out_path}")
+        np.save(out_path, P.astype(np.float32, copy=False))
+    elif save_fmt == "fp16":
+        out_path = args.output_path if args.output_path.endswith('.npy') else args.output_path + '.npy'
+        print(f"[FKD_H][Offline] Saving float16 npy to {out_path}")
+        np.save(out_path, P.astype(np.float16, copy=False))
+    elif save_fmt == "uint8":
+        assert int(getattr(args, 'quantize_bits', 8)) == 8, "Only 8-bit quantization supported"
+        print("[FKD_H][Offline] Quantizing rows to uint8 with per-row scales ...")
+        row_max = P.max(axis=1).astype(np.float16)
+        safe_scale = np.where(row_max > 1e-12, row_max, 1.0).astype(np.float16)
+        data_u8 = (P / safe_scale[:, None] * 255.0).clip(0, 255).round().astype(np.uint8)
+        out_path = args.output_path if args.output_path.endswith('.npz') else args.output_path + '.npz'
+        np.savez(out_path,
+                 format=np.array(["uint8"], dtype=object),
+                 data=data_u8,
+                 scales=safe_scale.astype(np.float16),
+                 shape=np.array([n_rows, n_cols], dtype=np.int32))
+        del data_u8
+        print(f"[FKD_H][Offline] Saved uint8 + scales to {out_path}")
+    elif save_fmt == "topk":
+        K_req = int(getattr(args, 'topk', 64))
+        K = n_cols if K_req <= 0 else min(K_req, n_cols)
+        print(f"[FKD_H][Offline] Extracting top-{K} per row (of {n_cols}) ...")
+        inds = np.empty((n_rows, K), dtype=np.int32)
+        vals = np.empty((n_rows, K), dtype=np.float16)
+        batch = 2048
+        for i in range(0, n_rows, batch):
+            ie = min(i + batch, n_rows)
+            block = P[i:ie]
+            part = np.argpartition(block, -K, axis=1)[:, -K:]
+            v = np.take_along_axis(block, part, axis=1)
+            order = np.argsort(-v, axis=1)
+            part_sorted = np.take_along_axis(part, order, axis=1)
+            v_sorted = np.take_along_axis(v, order, axis=1)
+            inds[i:ie] = part_sorted.astype(np.int32)
+            vals[i:ie] = v_sorted.astype(np.float16)
+        out_path = args.output_path if args.output_path.endswith('.npz') else args.output_path + '.npz'
+        np.savez(out_path,
+                 format=np.array(["topk"], dtype=object),
+                 indices=inds,
+                 values=vals,
+                 k=np.array([K], dtype=np.int32),
+                 shape=np.array([n_rows, n_cols], dtype=np.int32))
+        del inds, vals
+        print(f"[FKD_H][Offline] Saved top-{K} sparse .npz to {out_path}")
+    else:
+        raise ValueError(f"Unknown save-format: {save_fmt}")
+
+    print(f"[FKD_H][Offline] Saved global alignment with shape {P.shape}")
 
 
 if __name__ == "__main__":

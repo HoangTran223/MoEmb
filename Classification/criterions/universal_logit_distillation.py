@@ -1,4 +1,6 @@
+import os
 import torch
+import torch.nn as nn
 from .cross_entropy_loss import CrossEntropyLoss
 
 class UniversalLogitDistillation(CrossEntropyLoss):
@@ -65,10 +67,37 @@ class UniversalLogitDistillation(CrossEntropyLoss):
     def compute_universal_logit_distillation_loss(
         self, outputs, teacher_outputs, output_data, distiller, log
     ):
-        student_logits = outputs.logits  # [batch_size, num_classes]
-        teacher_logits = teacher_outputs.logits  # [batch_size, num_classes]
+        student_logits = outputs.logits  # [batch_size, num_labels]
+        # Teacher backbone doesn't output logits; build teacher logits via classifier head
+        last_hidden = teacher_outputs.hidden_states[-1]
+        # Mistral (decoder-only) -> take last token representation
+        teacher_pooled = last_hidden[:, -1, :]
+        device = teacher_pooled.device
 
-        # Handle potential mismatch in number of classes (vocab size)
+        # reuse cached classifier if available
+        teacher_classifier = getattr(distiller, 'teacher_classifier', None)
+        if teacher_classifier is None:
+            ckpt_dir = getattr(distiller.args, 'teacher_model_path', None)
+            if ckpt_dir:
+                clf_path = os.path.join(ckpt_dir, 'classifier.pt')
+                if os.path.exists(clf_path):
+                    loaded = torch.load(clf_path, map_location=device)
+                    if isinstance(loaded, nn.Module):
+                        teacher_classifier = loaded
+                    else:
+                        in_features = teacher_pooled.size(-1)
+                        out_features = student_logits.size(-1)
+                        head = nn.Linear(in_features, out_features, device=device, dtype=teacher_pooled.dtype)
+                        head.load_state_dict(loaded)
+                        teacher_classifier = head
+                    distiller.teacher_classifier = teacher_classifier.to(device).eval()
+        if teacher_classifier is None:
+            raise RuntimeError("Teacher classifier head not found. Ensure classifier.pt exists in teacher_model_path.")
+
+        with torch.no_grad():
+            teacher_logits = teacher_classifier(teacher_pooled)
+
+    # Handle potential mismatch in number of classes (should match num_labels)
         vocab_size_gap = student_logits.shape[-1] - teacher_logits.shape[-1]
         if vocab_size_gap > 0:
             # Pad teacher logits with zeros if student has more classes

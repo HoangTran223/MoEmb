@@ -7,7 +7,6 @@ from transformers import (
     AutoTokenizer,
     AutoModel,
 )
-from transformers.modeling_outputs import SequenceClassifierOutput
 from peft import (
     PeftModel,
     LoraConfig,
@@ -77,48 +76,56 @@ class Distiller(nn.Module):
         return tokenizer
 
     class SequenceClassifierWrapper(nn.Module):
-        """Wrap an AutoModel with a simple classification head.
-        - For encoder models (e.g., BERT): use CLS token (index 0)
-        - For decoder-only models (e.g., Mistral): use last token (index -1)
-        Returns SequenceClassifierOutput with logits, loss (optional) and hidden_states.
+        """Wrap an AutoModel backbone with a simple classification head.
+        - Encoder (e.g., BERT): use CLS token (index 0)
+        - Decoder-only (e.g., Mistral): use last token (index -1)
+        Exposes SequenceClassifier-like outputs with logits and supports hidden_states.
         """
+
         def __init__(self, base_model: AutoModel, hidden_size: int, num_labels: int, dtype: torch.dtype):
             super().__init__()
-            self.base_model = base_model
-            self.config = getattr(base_model, 'config', None)
-            self.hidden_size = hidden_size
-            self.num_labels = num_labels
-            self.classifier = nn.Linear(hidden_size, num_labels, dtype=dtype, device=next(base_model.parameters()).device)
-            # naming compatibility for downstream save logic
-            # BERT-like
-            self.classifier_name = 'classifier'
+            self.base = base_model
+            self.num_labels = int(num_labels)
+            self.classifier = nn.Linear(hidden_size, self.num_labels, bias=True).to(dtype)
 
-        def forward(self, input_ids, attention_mask=None, labels=None, output_hidden_states=False, return_dict=True, **kwargs):
-            outputs = self.base_model(
+        def forward(self, input_ids=None, attention_mask=None, labels=None, output_hidden_states=False, return_dict=True, **kwargs):
+            out = self.base(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
-                output_hidden_states=True,
+                output_hidden_states=True,  # always gather for FKD
                 return_dict=True,
+                **kwargs,
             )
-            last_hidden = outputs.last_hidden_state
-            # decide pooling by config
-            use_last_token = bool(getattr(self.config, 'is_decoder', False))
-            if use_last_token:
-                pooled = last_hidden[:, -1, :]
+            hs = out.hidden_states  # tuple [L+1]*[B,T,H]
+            last = hs[-1]
+            # choose pooling
+            if hasattr(self.base.config, 'is_encoder_decoder') and self.base.config.is_encoder_decoder:
+                pooled = last[:, 0]  # [CLS]-like for enc-dec encoders
             else:
-                pooled = last_hidden[:, 0, :]
+                if getattr(self.base.config, 'model_type', '') in ['bert', 'roberta', 'albert', 'deberta', 'deberta-v2']:
+                    pooled = last[:, 0]
+                else:
+                    # decoder-only
+                    if attention_mask is not None:
+                        lengths = attention_mask.long().sum(dim=1) - 1
+                        pooled = last[torch.arange(last.size(0), device=last.device), lengths]
+                    else:
+                        pooled = last[:, -1]
             logits = self.classifier(pooled)
+
+            if not return_dict:
+                return (logits, hs)
+
+            from transformers.modeling_outputs import SequenceClassifierOutput
             loss = None
             if labels is not None:
-                loss = nn.CrossEntropyLoss()(logits, labels)
-            if return_dict:
-                return SequenceClassifierOutput(
-                    loss=loss,
-                    logits=logits,
-                    hidden_states=outputs.hidden_states,
-                    attentions=getattr(outputs, 'attentions', None),
-                )
-            return logits
+                loss = nn.functional.cross_entropy(logits, labels)
+            return SequenceClassifierOutput(
+                loss=loss,
+                logits=logits,
+                hidden_states=hs,
+                attentions=getattr(out, 'attentions', None),
+            )
         
     def set_and_load_existing_projectors(self):
         self.projectors = nn.ModuleDict()
@@ -193,72 +200,60 @@ class Distiller(nn.Module):
         else:
             raise NotImplementedError("Invalid model_dtype for f`{self.args.model_dtype}`")
 
-        if self.args.peft is not None: #for LLM2Vec student
-            if self.args.peft == "lora":
-                config = AutoConfig.from_pretrained("McGill-NLP/LLM2Vec-Mistral-7B-Instruct-v2-mntp", trust_remote_code=True)
-                config.is_model_parallel = False
-                tokenizer = self.load_tokenizer("McGill-NLP/LLM2Vec-Mistral-7B-Instruct-v2-mntp")
-                self.hidden_size = getattr(config, "n_embed", getattr(config, "hidden_size", None))
-                base = AutoModel.from_pretrained(
-                    "McGill-NLP/LLM2Vec-Mistral-7B-Instruct-v2-mntp",
-                    config=config,
-                    device_map=None,
-                    torch_dtype=self.dtype,
-                    trust_remote_code=True,
-                )
-                # merge pretrained lora adapters (MNTP and supervised)
-                base = PeftModel.from_pretrained(
-                    base, "McGill-NLP/LLM2Vec-Mistral-7B-Instruct-v2-mntp",
-                ).merge_and_unload()
-                base = PeftModel.from_pretrained(
-                    base, "McGill-NLP/LLM2Vec-Mistral-7B-Instruct-v2-mntp-supervised"
-                ).merge_and_unload()
-                base.config.pad_token_id = getattr(base.config, 'pad_token_id', 2)
-                # apply new lora for fine-tuning if training (on base/backbone only)
-                if self.args.do_train:
-                    peft_config = LoraConfig(
-                        task_type=TaskType.FEATURE_EXTRACTION,
-                        inference_mode=(not self.args.do_train),
-                        r=self.args.peft_lora_r,
-                        lora_alpha=self.args.peft_lora_alpha,
-                        lora_dropout=self.args.peft_lora_dropout,
-                        target_modules=[
-                            "q_proj", "k_proj", "v_proj", "o_proj",
-                            "gate_proj", "up_proj", "down_proj"
-                        ]
-                    )
-                    base = get_peft_model(base, peft_config)
-                    trainable_params = sum(p.numel() for p in base.parameters() if p.requires_grad)
-                    all_params = sum(p.numel() for p in base.parameters())
-                    print(f"Trainable parameters (backbone LoRA): {trainable_params}/{all_params} ({trainable_params/all_params:.2%})")
-                # wrap with classifier head
-                model = Distiller.SequenceClassifierWrapper(base, self.hidden_size, self.args.num_labels, self.dtype)
-            else:
-                raise NotImplementedError
-        else: #for BERT
-            config = AutoConfig.from_pretrained("bert-base-uncased", trust_remote_code=True)
+        if self.args.peft is not None and self.args.peft == "lora":
+            # LLM2Vec student: backbone AutoModel + merge MNTP + supervised, then apply LoRA on backbone
+            base_name = "McGill-NLP/LLM2Vec-Mistral-7B-Instruct-v2-mntp"
+            config = AutoConfig.from_pretrained(base_name, trust_remote_code=True)
             config.is_model_parallel = False
-    
-            # lấy tokenizer
-            tokenizer = self.load_tokenizer("bert-base-uncased")
-            
-            self.hidden_size = getattr(config, "n_embed", getattr(config, "hidden_size", None))
+            tokenizer = self.load_tokenizer(base_name)
+            self.hidden_size = getattr(config, 'n_embed', None) or getattr(config, 'hidden_size', None)
             base = AutoModel.from_pretrained(
-                "bert-base-uncased",
+                base_name,
                 config=config,
                 device_map=None,
                 torch_dtype=self.dtype,
                 trust_remote_code=True,
             )
-            model = Distiller.SequenceClassifierWrapper(base, self.hidden_size, self.args.num_labels, self.dtype)
-            log_rank(' > number of parameters: {:,}'.format(
-                sum([p.nelement() for p in model.parameters()])
-            ))
+            base.config.pad_token_id = getattr(base.config, 'pad_token_id', 2)
+            # Merge MNTP
+            base = PeftModel.from_pretrained(base, base_name).merge_and_unload()
+            # Merge supervised (not unsup-simcse)
+            base = PeftModel.from_pretrained(base, f"{base_name}-supervised").merge_and_unload()
+            # Apply new LoRA for fine-tuning
+            if self.args.do_train:
+                peft_config = LoraConfig(
+                    task_type=TaskType.FEATURE_EXTRACTION,
+                    inference_mode=(not self.args.do_train),
+                    r=self.args.peft_lora_r,
+                    lora_alpha=self.args.peft_lora_alpha,
+                    lora_dropout=self.args.peft_lora_dropout,
+                    target_modules=[
+                        "q_proj", "k_proj", "v_proj", "o_proj",
+                        "gate_proj", "up_proj", "down_proj"
+                    ]
+                )
+                base = get_peft_model(base, peft_config)
+            # Wrap with classification head
+            model = self.SequenceClassifierWrapper(base, self.hidden_size, self.args.num_labels, self.dtype)
+        else:
+            # BERT student: backbone AutoModel + wrapper head
+            bert_name = "bert-base-uncased"
+            config = AutoConfig.from_pretrained(bert_name, trust_remote_code=True)
+            config.is_model_parallel = False
+            tokenizer = self.load_tokenizer(bert_name)
+            self.hidden_size = getattr(config, 'n_embed', None) or getattr(config, 'hidden_size', None)
+            base = AutoModel.from_pretrained(
+                bert_name,
+                config=config,
+                device_map=None,
+                torch_dtype=self.dtype,
+                trust_remote_code=True,
+            )
+            model = self.SequenceClassifierWrapper(base, self.hidden_size, self.args.num_labels, self.dtype)
 
         if self.args.gradient_checkpointing:
-            # enable on base model if available
             try:
-                model.base_model.gradient_checkpointing_enable()
+                model.base.gradient_checkpointing_enable()
             except Exception:
                 model.gradient_checkpointing_enable()
 
@@ -266,37 +261,29 @@ class Distiller(nn.Module):
     
     def load_teacher_model(self):
         log_rank("Loading teacher model...")
-        config = AutoConfig.from_pretrained(
-            "McGill-NLP/LLM2Vec-Mistral-7B-Instruct-v2-mntp",
-            trust_remote_code=True
-        )
+        base_name = "McGill-NLP/LLM2Vec-Mistral-7B-Instruct-v2-mntp"
+        config = AutoConfig.from_pretrained(base_name, trust_remote_code=True)
         config.is_model_parallel = False
 
-        tokenizer = self.load_tokenizer("McGill-NLP/LLM2Vec-Mistral-7B-Instruct-v2-mntp")
+        tokenizer = self.load_tokenizer(base_name)
 
         if hasattr(config, "n_embed"):
             self.teacher_hidden_size = config.n_embed
         else:
             self.teacher_hidden_size = config.hidden_size
 
-        # Teacher: use AutoModel backbone and merge MNTP + supervised adapters for feature extraction
         base = AutoModel.from_pretrained(
-            "McGill-NLP/LLM2Vec-Mistral-7B-Instruct-v2-mntp",
+            base_name,
             config=config,
             device_map=None,
             torch_dtype=self.dtype,
             trust_remote_code=True,
         )
         base.config.pad_token_id = getattr(base.config, 'pad_token_id', 2)
-        teacher_model = PeftModel.from_pretrained(
-            base,
-            "McGill-NLP/LLM2Vec-Mistral-7B-Instruct-v2-mntp",
-        )
-        teacher_model = teacher_model.merge_and_unload()  # may take time on CPU
-        # Load supervised adapter instead of unsupervised simcse
-        teacher_model = PeftModel.from_pretrained(
-            teacher_model, "McGill-NLP/LLM2Vec-Mistral-7B-Instruct-v2-mntp-supervised"
-        ).merge_and_unload()
+        # Merge MNTP
+        teacher_model = PeftModel.from_pretrained(base, base_name).merge_and_unload()
+        # Merge supervised adapter instead of unsup-simcse
+        teacher_model = PeftModel.from_pretrained(teacher_model, f"{base_name}-supervised").merge_and_unload()
 
         if getattr(self.args, 'teacher_model_path', None):
             adapter_dir = self.args.teacher_model_path
@@ -313,7 +300,8 @@ class Distiller(nn.Module):
             else:
                 log_rank(f"[Teacher][WARN] Provided teacher_model_path '{adapter_dir}' is not a valid PEFT adapter directory (missing adapter_config.json or weights). Skipping.")
 
-            # No classifier head needed for teacher backbone in FKD; skip loading any classifier
+            # Bỏ tải head phân loại vì teacher dùng AutoModel (chỉ cần hidden_states cho FKD)
+            pass
         for param in teacher_model.parameters():
             param.requires_grad = False
         

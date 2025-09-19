@@ -34,7 +34,9 @@ class FKD_H(nn.Module):
         print(f"[FKD_H] Loss weights: alpha={self.alpha}, beta={self.beta}")
 
         # Hybrid mixing coef lambda for global part
-        self.lambda_h = getattr(args, 'fkd_final_lambda', 0.5)
+        self.lambda_h = getattr(args, 'fkd_h_lambda', None)
+        if self.lambda_h is None:
+            self.lambda_h = getattr(args, 'fkd_final_lambda', 0.5)
 
         # Required global alignment matrix path
         self.global_alignment_path = getattr(args, 'global_alignment_path', None)
@@ -109,128 +111,217 @@ class FKD_H(nn.Module):
             print(f"[FKD_H] 'offline_projection_path' not provided. Defaulting to {self.offline_proj_path}")
 
     # ---------- helpers ----------
-    def _find_token_overlaps(self, teacher_tokenizer, student_tokenizer, teacher_ids, student_ids, teacher_texts, student_texts):
+    def _find_token_overlaps(self, 
+                              teacher_tokenizer, 
+                              student_tokenizer, 
+                              teacher_ids, 
+                              student_ids, 
+                              teacher_texts=None, 
+                              student_texts=None,
+                              teacher_attention_mask=None,
+                              student_attention_mask=None):
         """
-        Find overlapping tokens between teacher and student sequences based on character spans (theoretical, correct).
-        Args:
-            teacher_tokenizer, student_tokenizer: tokenizer objects
-            teacher_ids, student_ids: [B, T], [B, S] token ID tensors
-            teacher_texts, student_texts: list of original text strings (should be same for each pair)
-        Returns:
-            overlaps: List of length B, each element is list of (t_idx, s_idx) pairs for overlapping tokens
+        Strict span-based overlap using offset_mapping from both tokenizers.
+        Supports sentence-pair inputs: each sample text is a tuple (premise, hypothesis).
+
+        Returns a list of length B, each element is a list of (t_idx, s_idx) pairs
+        such that the teacher token span intersects the student token span in character space.
         """
-        batch_size = teacher_ids.size(0)
+        if teacher_texts is None or student_texts is None:
+            raise ValueError("[FKD_H] teacher_texts and student_texts are required for span-based overlap.")
+
+        B = teacher_ids.size(0)
         overlaps = []
-        for b in range(batch_size):
-            t_ids = teacher_ids[b].cpu().tolist()
-            s_ids = student_ids[b].cpu().tolist()
-            # Remove padding tokens
-            t_ids = [t for t in t_ids if t != 0]
-            s_ids = [s for s in s_ids if s != 0]
-            # Decode tokens to string pieces
-            t_tokens = teacher_tokenizer.convert_ids_to_tokens(t_ids, skip_special_tokens=True)
-            s_tokens = student_tokenizer.convert_ids_to_tokens(s_ids, skip_special_tokens=True)
-            # Get original text (if batch, use b-th)
-            teacher_text = teacher_texts[b] if isinstance(teacher_texts, (list, tuple)) else teacher_texts
-            student_text = student_texts[b] if isinstance(student_texts, (list, tuple)) else student_texts
-            # Compute character spans for each token
-            def get_token_spans(tokenizer, tokens, text):
-                spans = []
-                text_ptr = 0
-                for tok in tokens:
-                    # Remove special prefix (e.g., '##' in BERT)
-                    clean_tok = tok.replace('##', '')
-                    # Find token in text starting from text_ptr
-                    idx = text.find(clean_tok, text_ptr)
-                    if idx == -1:
-                        # Fallback: try from start
-                        idx = text.find(clean_tok)
-                    if idx == -1:
-                        # Cannot find, skip
-                        spans.append((None, None))
+
+        for b in range(B):
+            # fetch raw texts; for SentencePair they are (premise, hypothesis)
+            t_text = teacher_texts[b]
+            s_text = student_texts[b]
+            if not isinstance(t_text, (tuple, list)) or not isinstance(s_text, (tuple, list)):
+                raise ValueError("[FKD_H] Each text entry must be a (premise, hypothesis) pair.")
+            t_prem, t_hypo = t_text
+            s_prem, s_hypo = s_text
+
+            # Re-tokenize with offset mappings to get per-token spans
+            t_enc = teacher_tokenizer(
+                t_prem, t_hypo,
+                add_special_tokens=True,
+                max_length=self.args.max_length,
+                truncation=True,
+                padding=False,
+                return_offsets_mapping=True,
+            )
+            s_enc = student_tokenizer(
+                s_prem, s_hypo,
+                add_special_tokens=True,
+                max_length=self.args.max_length,
+                truncation=True,
+                padding=False,
+                return_offsets_mapping=True,
+            )
+
+            # Determine valid token positions (exclude specials) using sequence_ids
+            t_seq_ids = t_enc.sequence_ids()
+            s_seq_ids = s_enc.sequence_ids()
+            t_offsets = t_enc["offset_mapping"]
+            s_offsets = s_enc["offset_mapping"]
+
+            # Limit by provided attention masks to ensure index alignment with input ids
+            if teacher_attention_mask is not None:
+                t_max = int(teacher_attention_mask[b].sum().item())
+            else:
+                t_max = len(t_seq_ids)
+            if student_attention_mask is not None:
+                s_max = int(student_attention_mask[b].sum().item())
+            else:
+                s_max = len(s_seq_ids)
+
+            def collect_valid(seq_ids, offsets, max_len):
+                spans = []  # list of (start, end, idx)
+                for i in range(min(len(seq_ids), max_len)):
+                    sid = seq_ids[i]
+                    off = offsets[i]
+                    # skip special tokens and padding (offsets like (0,0))
+                    if sid is None:
                         continue
-                    start = idx
-                    end = idx + len(clean_tok)
-                    spans.append((start, end))
-                    text_ptr = end
+                    if off is None:
+                        continue
+                    start, end = off
+                    if start is None or end is None:
+                        continue
+                    if end <= start:
+                        continue
+                    spans.append((start, end, i))
                 return spans
-            t_spans = get_token_spans(teacher_tokenizer, t_tokens, teacher_text)
-            s_spans = get_token_spans(student_tokenizer, s_tokens, student_text)
-            # Overlap: (t_idx, s_idx) if spans overlap
+
+            t_spans = collect_valid(t_seq_ids, t_offsets, t_max)
+            s_spans = collect_valid(s_seq_ids, s_offsets, s_max)
+
+            # Build overlaps by span intersection
             batch_overlaps = []
-            for s_idx, s_span in enumerate(s_spans):
-                s_start, s_end = s_span
-                if s_start is None:
-                    continue
-                for t_idx, t_span in enumerate(t_spans):
-                    t_start, t_end = t_span
-                    if t_start is None:
-                        continue
-                    # Check overlap
-                    if not (s_end <= t_start or t_end <= s_start):
-                        batch_overlaps.append((t_idx, s_idx))
+            ti = 0
+            si = 0
+            # two-pointer sweep by character start positions
+            t_spans_sorted = sorted(t_spans, key=lambda x: (x[0], x[1]))
+            s_spans_sorted = sorted(s_spans, key=lambda x: (x[0], x[1]))
+            while ti < len(t_spans_sorted) and si < len(s_spans_sorted):
+                t_start, t_end, t_idx = t_spans_sorted[ti]
+                s_start, s_end, s_idx = s_spans_sorted[si]
+                # intersection length > 0?
+                inter = min(t_end, s_end) - max(t_start, s_start)
+                if inter > 0:
+                    batch_overlaps.append((t_idx, s_idx))
+                    # advance the one that ends first to find more matches
+                    if t_end <= s_end:
+                        ti += 1
+                    else:
+                        si += 1
+                else:
+                    # advance the earlier-starting token
+                    if t_start < s_start:
+                        ti += 1
+                    else:
+                        si += 1
+
+            if not batch_overlaps:
+                # strict policy: if no overlaps, raise early to surface data mismatch
+                raise RuntimeError("[FKD_H] No span overlaps found for a sample. Check tokenization consistency and max_length.")
+
             overlaps.append(batch_overlaps)
+
         return overlaps
 
     def _compute_hybrid_alignment(self, s_last, t_proj, teacher_ids, student_ids, teacher_tokenizer, student_tokenizer, overlaps, device, dtype):
-        """Compute hybrid alignment scores using contextual + global scores, only for overlapping tokens.
-        
-        Args:
-            s_last: [B, S, H_S] student last layer hidden states
-            t_proj: [B, T, H_S] projected teacher hidden states
-            teacher_ids, student_ids: token ID tensors
-            overlaps: list of overlap pairs from _find_token_overlaps
-            
-        Returns:
-            q_T: [B, S, H_S] aggregated teacher representations for each student token
+        """Sparse hybrid alignment: compute scores only on overlapping (t_idx, s_idx) pairs.
+
+        Returns q_T with shape [B, S, H_S].
         """
         B, S, H_S = s_last.shape
-        T = t_proj.size(1)
-        
-        # Initialize output
-        q_T = torch.zeros_like(s_last)  # [B, S, H_S]
-        
-        # Compute contextual scores for all pairs (we'll mask later)
+        q_T = torch.zeros_like(s_last)
+
+        # Normalize once
         s_norm = F.normalize(s_last, p=2, dim=-1)
         t_norm = F.normalize(t_proj, p=2, dim=-1)
-        ctx_scores = torch.einsum('bsh,bth->bst', s_norm, t_norm)  # [B, S, T]
-        
-        # Get global scores
-        glob_scores = self._slice_global_scores(teacher_ids, student_ids, device, dtype)  # [B, T, S]
-        glob_scores = glob_scores.transpose(1, 2)  # [B, S, T]
-        
-        # Hybrid scores
         lam = float(self.lambda_h)
-        hybrid = (1.0 - lam) * ctx_scores + lam * glob_scores
-        
-        # Process each batch item separately using overlap information
+
         for b in range(B):
             batch_overlaps = overlaps[b]
             if not batch_overlaps:
-                # No overlaps found, fall back to using last teacher hidden state
-                q_T[b] = t_proj[b, -1:].expand(S, -1)  # Broadcast last teacher state
+                # if nothing, keep zeros (or copy last teacher state if desired)
                 continue
-            
-            # Group overlaps by student token
-            s_to_t_map = {}
-            for t_idx, s_idx in batch_overlaps:
-                if s_idx not in s_to_t_map:
-                    s_to_t_map[s_idx] = []
-                s_to_t_map[s_idx].append(t_idx)
-            
-            # For each student token, compute weighted combination of overlapping teacher tokens
-            for s_idx, t_indices in s_to_t_map.items():
-                if s_idx >= S:  # Skip if out of bounds
+
+            # group by student index
+            s_to_t = {}
+            for t_i, s_i in batch_overlaps:
+                if 0 <= s_i < S:
+                    s_to_t.setdefault(s_i, []).append(t_i)
+
+            if not s_to_t:
+                continue
+
+            # cache teacher ids row for global pairs
+            t_ids_row = teacher_ids[b]
+            s_ids_row = student_ids[b]
+
+            for s_i, t_list in s_to_t.items():
+                if len(t_list) == 0:
                     continue
-                t_indices = torch.tensor(t_indices, device=device)
-                # Get hybrid scores for this student token and overlapping teacher tokens
-                scores = hybrid[b, s_idx, t_indices]  # [num_overlaps]
-                # Không dùng top-k, chỉ dùng toàn bộ overlap thực sự
-                weights = torch.softmax(scores, dim=-1)
-                teacher_reprs = t_proj[b, t_indices]  # [num_overlaps, H_S]
-                q_T[b, s_idx] = (weights.unsqueeze(-1) * teacher_reprs).sum(dim=0)
-        
+                t_idx = torch.tensor(t_list, device=device, dtype=torch.long)
+
+                # contextual scores for this s_i against selected t's: [K]
+                ctx = torch.mv(t_norm[b, t_idx], s_norm[b, s_i])
+
+                # global scores for these (t_ids, s_id): [K]
+                gvec = self._global_scores_for_pairs(t_ids_row[t_idx].detach().cpu().numpy(), int(s_ids_row[s_i].item()))
+                gvec = torch.from_numpy(gvec).to(device=device, dtype=ctx.dtype)
+
+                scores = (1.0 - lam) * ctx + lam * gvec
+                w = torch.softmax(scores, dim=-1)
+                q_T[b, s_i] = torch.matmul(w, t_proj[b, t_idx])
+
         return q_T
+
+    def _global_scores_for_pairs(self, teacher_ids_vec_np: np.ndarray, student_id: int) -> np.ndarray:
+        """Return global alignment scores for pairs (teacher_ids_vec, student_id).
+        Output shape: [len(teacher_ids_vec)], dtype float16 as numpy.
+        """
+        GA_np = getattr(self, '_global_align_np', None)
+        GA_npz = getattr(self, '_global_align_npz', None)
+        if GA_np is not None:
+            # memmap dense: advanced indexing rows, single column
+            col = np.asarray([student_id], dtype=np.int64)
+            sub = GA_np[np.asarray(teacher_ids_vec_np, dtype=np.int64)[:, None], col]  # [K,1]
+            return sub.astype(np.float16, copy=False).ravel()
+        elif GA_npz is not None:
+            fmt = (self._global_align_meta or {}).get('format', 'unknown')
+            if fmt == 'uint8':
+                data = GA_npz['data']
+                scales = GA_npz['scales'].astype(np.float32, copy=False)
+                rows = np.asarray(teacher_ids_vec_np, dtype=np.int64)
+                u8 = data[rows, student_id]
+                sc = scales[rows]
+                sub = (u8.astype(np.float32) / 255.0) * sc
+                return sub.astype(np.float16, copy=False)
+            elif fmt == 'topk':
+                inds = GA_npz['indices']  # [V, K]
+                vals = GA_npz['values']   # [V, K] (fp16)
+                rows = np.asarray(teacher_ids_vec_np, dtype=np.int64)
+                out = np.zeros((rows.shape[0],), dtype=np.float16)
+                for i, r in enumerate(rows):
+                    row_inds = inds[r]
+                    row_vals = vals[r]
+                    # find position of student_id in row_inds (K is small)
+                    # vectorized equality then any
+                    match = (row_inds == student_id)
+                    if match.any():
+                        pos = int(np.argmax(match))
+                        out[i] = row_vals[pos]
+                return out
+            else:
+                raise RuntimeError(f"[FKD_H] Unknown compressed alignment format: {fmt}")
+        else:
+            # No GA available; return zeros
+            return np.zeros((teacher_ids_vec_np.shape[0],), dtype=np.float16)
     def _slice_global_scores(self, teacher_ids: torch.Tensor, student_ids: torch.Tensor, device, dtype):
         """Slice the global alignment sub-matrix for given token id sequences.
         Returns [B, T, S] tensor on device.
@@ -472,84 +563,62 @@ class FKD_H(nn.Module):
         W_q = self._ensure_wq(distiller, H_T, H_S, device, dtype)
         t_proj = W_q(t_fused)  # [B,T,H_S]
 
-        # Get student last layer
-        s_last = s_hs[-1]  # [B,S,H_S]
+        # Token id tensors
         teacher_ids = input_data.get("teacher_input_ids", input_data["input_ids"])  # [B,T]
         student_ids = input_data["input_ids"]  # [B,S]
 
-        # Find token overlaps (phải truyền text gốc vào)
-        try:
-            teacher_tokenizer = distiller.teacher_tokenizers
-            student_tokenizer = distiller.student_tokenizer
-            # Lấy text gốc từ batch
-            teacher_texts = input_data.get('teacher_texts', None)
-            student_texts = input_data.get('student_texts', None)
-            # Nếu không có, thử lấy 'text' (dùng cho cả teacher và student)
-            if teacher_texts is None and 'text' in input_data:
-                teacher_texts = input_data['text']
-            if student_texts is None and 'text' in input_data:
-                student_texts = input_data['text']
-            if teacher_texts is None or student_texts is None:
-                raise ValueError("Batch input_data phải có trường 'teacher_texts' và 'student_texts' hoặc 'text' để tìm overlap token!")
-            # Flatten tuple texts into single strings for overlap logic
-            if isinstance(teacher_texts, (list, tuple)):
-                teacher_texts = [" ".join(t) if isinstance(t, (list, tuple)) else t for t in teacher_texts]
-            if isinstance(student_texts, (list, tuple)):
-                student_texts = [" ".join(s) if isinstance(s, (list, tuple)) else s for s in student_texts]
-            overlaps = self._find_token_overlaps(
-                 teacher_tokenizer, student_tokenizer,
-                 teacher_ids, student_ids,
-                 teacher_texts, student_texts
-             )
-            # In debug số lượng overlap trên batch
-            # overlap_counts = [len(ov) for ov in overlaps]
-            # print(f"[FKD_H][DEBUG] Số lượng overlap trên batch: {overlap_counts}")
-
-        except Exception as e:
-            print(f"[FKD_H][WARN] Không tìm được overlap thực sự: {e}")
-            # Fallback: mọi combination (t_idx, s_idx)
-            B, T = teacher_ids.shape
-            S = student_ids.shape[1]
-            overlaps = []
-            for b in range(B):
-                batch_overlaps = [(t, s) for s in range(S) for t in range(T)]
-                overlaps.append(batch_overlaps)
-
-        # Compute hybrid alignment with proper overlap logic
-        q_T = self._compute_hybrid_alignment(
-            s_last, t_proj, teacher_ids, student_ids,
-            teacher_tokenizer if 'teacher_tokenizer' in locals() else None,
-            student_tokenizer if 'student_tokenizer' in locals() else None,
-            overlaps, device, dtype
-
+        # Find token overlaps using strict span policy
+        teacher_tokenizer = distiller.teacher_tokenizers
+        student_tokenizer = distiller.student_tokenizer
+        overlaps = self._find_token_overlaps(
+            teacher_tokenizer,
+            student_tokenizer,
+            teacher_ids,
+            student_ids,
+            teacher_texts=input_data.get("text", None),
+            student_texts=input_data.get("text", None),
+            teacher_attention_mask=input_data.get("teacher_attention_mask", None),
+            student_attention_mask=input_data.get("attention_mask", None),
         )
-        
-        # Student fusion over mapped layers with attention against q_T
+
+        # Student fusion over mapped layers with attention; compute per-layer Aj,i,k using H_S^{(k)}[j]
         mapped_student = fkd_info.get('mapped_student_layers', []) or []
         M_S = self._student_stack(s_hs, mapped_student)  # [B,S,M,H]
-        # Debug shape trước khi einsum
-        if M_S.dim() != 4 or q_T.dim() != 3:
-            print(f"[FKD_H][ERROR] M_S shape: {M_S.shape}, q_T shape: {q_T.shape}")
-            print(f"[FKD_H][DEBUG] input_data['text'][:2]: {input_data.get('text', None)[:2]}")
-            raise RuntimeError(f"[FKD_H] Shape mismatch: M_S {M_S.shape}, q_T {q_T.shape}")
-        if M_S.shape[0] != q_T.shape[0] or M_S.shape[1] != q_T.shape[1] or M_S.shape[3] != q_T.shape[2]:
-            print(f"[FKD_H][ERROR] M_S shape: {M_S.shape}, q_T shape: {q_T.shape}")
-            print(f"[FKD_H][DEBUG] input_data['text'][:2]: {input_data.get('text', None)[:2]}")
-            raise RuntimeError(f"[FKD_H] Shape mismatch: M_S {M_S.shape}, q_T {q_T.shape}")
-        # Attention scores - optimized with einsum for better performance
-        scores = torch.einsum('bsmh,bsh->bsm', M_S, q_T) / math.sqrt(M_S.size(-1))  # [B,S,M]
-        att_w = torch.softmax(scores, dim=-1)  # [B,S,M]
-        h_tilde = torch.einsum('bsm,bsmh->bsh', att_w, M_S)  # [B,S,H]
+        B, S, M, Hs = M_S.shape
+        # Compute per-layer teacher aggregates q_T_m using spans and contextual similarities from each student layer k
+        q_T_list = []
+        for m in range(M):
+            s_layer = M_S[:, :, m, :]  # [B,S,H]
+            q_T_m = self._compute_hybrid_alignment(
+                s_layer, t_proj, teacher_ids, student_ids,
+                teacher_tokenizer,
+                student_tokenizer,
+                overlaps, device, dtype
+            )  # [B,S,H]
+            q_T_list.append(q_T_m)
+        # Stack to [B,S,M,H]
+        if M == 1:
+            Q_T = q_T_list[0].unsqueeze(2)
+        else:
+            Q_T = torch.stack(q_T_list, dim=2)
 
-        # Distillation loss: 1 - mean cosine over valid student tokens
+        # Attention scores per layer using similarity between M_S[:,:,m,:] and corresponding Q_T[:,:,m,:]
+        # scores[b,s,m] = dot(M_S[b,s,m], Q_T[b,s,m]) / sqrt(H)
+        scores = (M_S * Q_T).sum(dim=-1) / math.sqrt(Hs)  # [B,S,M]
+        att_w = torch.softmax(scores, dim=-1)  # [B,S,M]
+        # Fuse student and teacher sides with same attention
+        h_tilde = torch.einsum('bsm,bsmh->bsh', att_w, M_S)  # [B,S,H]
+        q_tilde = torch.einsum('bsm,bsmh->bsh', att_w, Q_T)  # [B,S,H]
+
+        # Distillation loss: 1 - mean cosine over valid student tokens between fused reps
         s_mask = input_data.get("attention_mask", None)
         if s_mask is not None:
             s_mask = (s_mask > 0).to(device=device, dtype=dtype)
-            cos = F.cosine_similarity(h_tilde, q_T, dim=-1) * s_mask  # [B,S]
+            cos = F.cosine_similarity(h_tilde, q_tilde, dim=-1) * s_mask  # [B,S]
             denom = s_mask.sum().clamp(min=1.0)
             distill = 1.0 - (cos.sum() / denom)
         else:
-            cos = F.cosine_similarity(h_tilde, q_T, dim=-1)
+            cos = F.cosine_similarity(h_tilde, q_tilde, dim=-1)
             distill = 1.0 - cos.mean()
 
         total = self.alpha * ce_loss + self.beta * distill
